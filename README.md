@@ -4,6 +4,8 @@
 
 使用實體（entities）、關係（relations）與觀察（observations）跨對話儲存和擷取資訊。支援任何 MCP 相容的 AI 平台。
 
+> 本 fork 專為 **Windsurf 等多工作區 IDE** 設計：透過 `--workspace-only` 嚴格模式，把記憶強制隔離在各 workspace 的 `.aim/` 目錄。安裝只提供本地 `git clone`，部署只提供 Windsurf workspace 分離方式。
+
 ## 概覽
 
 本伺服器將記憶以知識圖譜結構持久化於本地 JSONL 檔案中，讓 AI 模型能在不同對話之間保留和查詢資訊。核心設計圍繞 **AIM（AI Memory）** 命名體系，透過 `.aim` 目錄、`aim_` 工具前綴與 `_aim` 檔案標記提供清晰組織與安全性。
@@ -21,33 +23,37 @@
 - **`.aim`** = 專案本地目錄名稱（必須精確命名為 `.aim`，專案偵測才能運作）
 - **`_aim`** = 檔案安全標記（出現在 JSONL 檔案內部：`{"type":"_aim","source":"mcp-knowledge-graph"}`）
 
-**專案本地儲存：** 目錄必須命名為 `.aim`，置於專案根目錄，例如 `my-project/.aim/memory.jsonl`。
-
-**全域儲存（`--memory-path`）：** 可使用任意目錄，例如 `~/.aim/`、`~/memories/`、`~/Dropbox/ai-memory/`。
+**workspace 本地儲存：** 目錄必須命名為 `.aim`，置於 workspace/專案根目錄，例如 `my-project/.aim/memory.jsonl`。`--workspace-only` 模式下記憶固定落在此處，不使用全域目錄。
 
 ### 主資料庫概念
 
 主資料庫（master database）是預設的記憶儲存，未指定資料庫時一律使用它。在列表中顯示為 `default`，檔案名為 `memory.jsonl`。
 
 - **預設行為**：所有記憶操作預設使用主資料庫
-- **隨處可用**：專案本地與全域位置皆存在
+- **workspace 本地**：儲存於當前 workspace 的 `.aim/`（`memory.jsonl`）
 - **主要儲存**：跨所有對話持久化的主要知識圖譜
 - **命名資料庫**：可選的額外資料庫（`work`、`personal`、`health`），按主題組織
 
-## 本地開發環境設定
+## 安裝（本地 git clone）
+
+> ⚠️ 本 fork 的 `projectRoot` / `--workspace-only` 功能**尚未發佈到 npm**。`npx -y mcp-knowledge-graph` 會抓到不含這些功能的上游套件，請務必用本地建置。
 
 ### 先決條件
 
 - Node.js 22+
-- MCP 相容的 AI 平台
+- Windsurf（或其他支援 MCP stdio 的 AI 平台）
 
-### 建置與測試
+### 取得並建置
 
 ```bash
-npm install        # 安裝依賴
-npm run build      # 編譯 TypeScript
-npm test           # 執行測試
+git clone https://github.com/lamjack/mcp-knowledge-graph.git
+cd mcp-knowledge-graph
+npm install        # 安裝依賴（postinstall 會自動 build 出 dist/）
+npm run build      # 重新編譯（可選）
+npm test           # 執行測試（可選）
 ```
+
+建置後記下 `dist/index.js` 的**絕對路徑**，Windsurf 配置會用到。
 
 ### 驗證建置
 
@@ -76,11 +82,11 @@ dist/
 
 ### 儲存邏輯
 
-**檔案位置優先順序：**
+**檔案位置（`--workspace-only` 模式）：**
 
-1. **專案含 `.aim` 目錄** — 使用 `.aim/memory.jsonl`（專案本地）
-2. **無專案或無 `.aim`** — 使用設定的全域目錄
-3. **指定 context** — 加後綴：`memory-work.jsonl`、`memory-personal.jsonl`
+1. **固定落於 `<projectRoot>/.aim/memory.jsonl`** — `projectRoot` 由 client（Cascade）以當前 workspace 絕對路徑傳入
+2. **指定 context** — 加後綴：`memory-work.jsonl`、`memory-personal.jsonl`
+3. **無全域退路** — 缺少 `projectRoot` 直接報錯，不會誤寫全域
 
 **安全系統：**
 
@@ -90,71 +96,20 @@ dist/
 
 ## 使用方式
 
-### 全域記憶（推薦）
+### 資料庫概念
 
-在 MCP 配置檔中加入以下設定。兩種常見做法：
-
-**選項一：預設 `.aim` 目錄（簡單）**
-
-```json
-{
-  "mcpServers": {
-    "Aim-Memory-Bank": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-knowledge-graph",
-        "--memory-path",
-        "/Users/yourusername/.aim"
-      ]
-    }
-  }
-}
-```
-
-**選項二：雲端同步目錄（跨機可攜）**
-
-使用同步資料夾在多台機器間共享記憶：
-
-```json
-{
-  "mcpServers": {
-    "Aim-Memory-Bank": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-knowledge-graph",
-        "--memory-path",
-        "/Users/yourusername/Dropbox/ai-memory"
-      ]
-    }
-  }
-}
-```
-
-這會在指定目錄建立記憶檔案：
-
-- `memory.jsonl` — **主資料庫**（預設操作）
-- `memory-work.jsonl` — 工作資料庫
-- `memory-personal.jsonl` — 個人資料庫
-
-### 專案本地記憶
-
-在任何專案中建立 `.aim` 目錄：
-
-```bash
-mkdir .aim
-```
-
-此後記憶工具自動使用 `.aim/memory.jsonl`（專案本地主資料庫），而非全域儲存。
+記憶以「資料庫」組織：預設主資料庫為 `memory.jsonl`；可選的命名資料庫（如 `work`）會加後綴成 `memory-work.jsonl`。所有資料庫都位於當前 workspace 的 `.aim/` 目錄下，透過 `context` 參數切換。
 
 ### AI 如何使用資料庫
 
-AI 模型預設使用主資料庫，也可透過 `context` 參數指定命名資料庫。新資料庫自動建立，無需額外設定：
+AI 模型預設使用主資料庫，也可透過 `context` 參數指定命名資料庫。新資料庫自動建立，無需額外設定。
+
+> `--workspace-only` 模式下**每次呼叫都必須帶 `projectRoot`**（當前 workspace 絕對路徑）；為簡潔，下列僅第一個範例顯示。
 
 ```json
 // 主資料庫（預設，無需 context）
 aim_memory_store({
+  projectRoot: "/Users/you/dev/my-project",
   entities: [{
     name: "John_Doe",
     entityType: "person",
@@ -181,37 +136,17 @@ aim_memory_store({
     observations: ["Birthday March 15th"]
   }]
 })
-
-// 指定位置的主資料庫
-aim_memory_store({
-  location: "global",
-  entities: [{
-    name: "Important_Info",
-    entityType: "reference",
-    observations: ["Stored in global master database"]
-  }]
-})
 ```
 
 ### 檔案組織
 
-**全域設定：**
-
-```tree
-/Users/yourusername/.aim/
-├── memory.jsonl           # 主資料庫（預設）
-├── memory-work.jsonl      # 工作資料庫
-├── memory-personal.jsonl  # 個人資料庫
-└── memory-health.jsonl    # 健康資料庫
-```
-
-**專案設定：**
+每個 workspace 的記憶檔案都在自己的 `.aim/` 目錄下：
 
 ```tree
 my-project/
 ├── .aim/
-│   ├── memory.jsonl       # 專案主資料庫（預設）
-│   └── memory-work.jsonl  # 專案工作資料庫
+│   ├── memory.jsonl       # workspace 主資料庫（預設）
+│   └── memory-work.jsonl  # workspace 工作資料庫
 └── src/
 ```
 
@@ -231,8 +166,8 @@ my-project/
 ### 參數
 
 - `context`（可選）— 指定命名資料庫（`work`、`personal` 等）。預設為主資料庫
-- `location`（可選）— 強制使用 `project` 或 `global` 儲存位置。預設為自動偵測
-- `projectRoot`（可選）— 當前工作區/專案根目錄的絕對路徑。設定後記憶儲存於 `<projectRoot>/.aim/`，覆蓋自動偵測。多工作區 IDE 必須使用（見下文）
+- `projectRoot`（**`--workspace-only` 下必填**）— 當前 workspace/專案根目錄的絕對路徑，記憶儲存於 `<projectRoot>/.aim/`
+- `location`（可選）— 強制儲存位置。`--workspace-only` 模式下僅接受 `project`，`global` 會被拒絕
 
 ## 多工作區支援
 
@@ -262,8 +197,6 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
 
 **驗證規則：** `projectRoot` 必須是已存在的絕對路徑目錄。相對路徑或不存在的路徑會被拒絕，以避免歧義並防止在非預期位置建立散落的 `.aim` 目錄。`context` 值仍會經過路徑穿越驗證，確保 `<projectRoot>/.aim/memory-<context>.jsonl` 永遠不會逃離工作區的 `.aim` 目錄。
 
-**替代方案（不使用 `projectRoot`）：** 若希望按專案隔離但不傳入路徑，可在 `mcp_config.json` 中為每個專案新增獨立的伺服器設定，各自指定 `--memory-path`。此方式需手動設定且每個專案會載入重複的工具集。
-
 ## Workspace-only 嚴格模式（強制隔離）
 
 若你的目標是「記憶**只能**存在當前 workspace 的 `.aim/`、且**不讀寫全域**」，啟用 `--workspace-only`（或環境變數 `AIM_WORKSPACE_ONLY=true`）。啟用後：
@@ -275,17 +208,9 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
 
 > ⚠️ 前提：Windsurf 目前**不支援 MCP `roots`**、MCP 設定為全域單一實例、且不注入 workspace 路徑，因此伺服器無法自行得知當前 workspace。嚴格模式透過「強制由 client 傳入 `projectRoot`」達成隔離，需搭配下方規則指示 Cascade 一律帶上當前 workspace 絕對路徑。
 
-### 在 Windsurf 安裝（本 fork）
+### 在 Windsurf 掛載
 
-> ⚠️ `npx -y mcp-knowledge-graph` 會抓 **npm 上游套件**，其**不含** `projectRoot` / `--workspace-only`。請改用本 fork 的本地建置：
-
-先建置：
-
-```bash
-npm install && npm run build
-```
-
-Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Config**，加入（設定檔官方為 `~/.codeium/mcp_config.json`，部分版本為 `~/.codeium/windsurf/mcp_config.json`；用 View Raw Config 最保險）：
+完成上方「安裝（本地 git clone）」後，Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Config**，加入以下設定（設定檔官方為 `~/.codeium/mcp_config.json`，部分版本為 `~/.codeium/windsurf/mcp_config.json`；用 View Raw Config 最保險）。記得將 `args` 第一項換成你實際的 `dist/index.js` 絕對路徑：
 
 ```json
 {
@@ -301,7 +226,7 @@ Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Co
 }
 ```
 
-存檔後按 **Refresh**。（嚴格模式下 `--memory-path` 非必要，因為不使用全域目錄。）
+存檔後按 **Refresh**。（嚴格模式下無需 `--memory-path`，不使用全域目錄。）
 
 ### 讓 Cascade 一律帶 projectRoot（全域規則）
 
@@ -318,42 +243,33 @@ Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Co
 ```json
 {
   "project_databases": [
-    "default",      // 主資料庫（專案本地）
+    "default",      // 主資料庫（workspace 本地）
     "project-work"  // 命名資料庫
   ],
-  "global_databases": [
-    "default",      // 主資料庫（全域）
-    "work",
-    "personal",
-    "health"
-  ],
+  "global_databases": [],
   "current_location": "project (.aim directory detected)"
 }
 ```
 
 **重點：**
 
-- **"default"** = 兩個位置的主資料庫
-- **current_location** 顯示目前使用專案或全域儲存
-- **主資料庫隨處存在** — 它是主要記憶儲存
+- **"default"** = 主資料庫
+- **current_location** 顯示當前 workspace 的 `.aim` 儲存位置
+- **global_databases 恆為空** — 嚴格模式不使用全域儲存
 - **命名資料庫** 是按主題組織的可選附加項
 
-## 配置範例
+## 配置範例（自動核准讀取）
 
-**重要：** 務必指定 `--memory-path` 以控制記憶檔案的儲存位置。
-
-**自動核准讀取操作（推薦）：**
+在 workspace-only 配置上加入 `autoapprove`，讓讀取類工具免確認：
 
 ```json
 {
   "mcpServers": {
-    "Aim-Memory-Bank": {
-      "command": "npx",
+    "aim-memory": {
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-knowledge-graph",
-        "--memory-path",
-        "/Users/yourusername/.aim"
+        "/absolute/path/to/knowledge-graph-mcp/dist/index.js",
+        "--workspace-only"
       ],
       "autoapprove": [
         "aim_memory_search",
@@ -376,10 +292,10 @@ Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Co
 
 ### 記憶儲存至非預期位置
 
-- 檢查是否在含 `.aim` 目錄的專案中（會使用專案本地儲存）
-- 否則使用設定的全域 `--memory-path` 目錄
-- 使用 `aim_memory_list_stores` 查看所有可用資料庫與當前位置
-- 使用 `ls .aim/` 或 `ls ~/.aim/` 查看記憶檔案
+- 確認 Cascade 呼叫時帶了正確的 `projectRoot`（當前 workspace 絕對路徑）
+- 使用 `aim_memory_list_stores`（帶 `projectRoot`）查看該 workspace 的資料庫與位置
+- 使用 `ls <workspace>/.aim/` 查看記憶檔案
+- 缺少 `projectRoot` 會直接報錯，不會誤寫其他位置
 
 ### 過多相似資料庫
 
