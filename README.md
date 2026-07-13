@@ -264,6 +264,53 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
 
 **替代方案（不使用 `projectRoot`）：** 若希望按專案隔離但不傳入路徑，可在 `mcp_config.json` 中為每個專案新增獨立的伺服器設定，各自指定 `--memory-path`。此方式需手動設定且每個專案會載入重複的工具集。
 
+## Workspace-only 嚴格模式（強制隔離）
+
+若你的目標是「記憶**只能**存在當前 workspace 的 `.aim/`、且**不讀寫全域**」，啟用 `--workspace-only`（或環境變數 `AIM_WORKSPACE_ONLY=true`）。啟用後：
+
+- **強制 `projectRoot`**：每次工具呼叫都必須帶 `projectRoot`，缺少即報錯（fail-closed），絕不默默寫入全域。
+- **停用全域**：`location:"global"` 被拒絕，也不再有全域 fallback。
+- **讀取隔離**：`aim_memory_list_stores` 只列出本 workspace 的資料庫，`global_databases` 一律為空。
+- **schema 提示**：`tools/list` 會把 `projectRoot` 標記為每個工具的必填欄位。
+
+> ⚠️ 前提：Windsurf 目前**不支援 MCP `roots`**、MCP 設定為全域單一實例、且不注入 workspace 路徑，因此伺服器無法自行得知當前 workspace。嚴格模式透過「強制由 client 傳入 `projectRoot`」達成隔離，需搭配下方規則指示 Cascade 一律帶上當前 workspace 絕對路徑。
+
+### 在 Windsurf 安裝（本 fork）
+
+> ⚠️ `npx -y mcp-knowledge-graph` 會抓 **npm 上游套件**，其**不含** `projectRoot` / `--workspace-only`。請改用本 fork 的本地建置：
+
+先建置：
+
+```bash
+npm install && npm run build
+```
+
+Windsurf → **Settings > Tools > Windsurf Settings > Add Server → View Raw Config**，加入（設定檔官方為 `~/.codeium/mcp_config.json`，部分版本為 `~/.codeium/windsurf/mcp_config.json`；用 View Raw Config 最保險）：
+
+```json
+{
+  "mcpServers": {
+    "aim-memory": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/knowledge-graph-mcp/dist/index.js",
+        "--workspace-only"
+      ]
+    }
+  }
+}
+```
+
+存檔後按 **Refresh**。（嚴格模式下 `--memory-path` 非必要，因為不使用全域目錄。）
+
+### 讓 Cascade 一律帶 projectRoot（全域規則）
+
+在 Windsurf 的全域規則，或每個專案的 `.windsurf/rules/` 中加入：
+
+> 呼叫任何 `aim_memory_*` 工具時，一律傳入 `projectRoot` 參數，其值為當前 workspace 的絕對根目錄路徑。若不確定，先確認工作區根目錄再呼叫。
+
+如此可確保記憶穩定落在 `<workspace>/.aim/`，達成跨 workspace 的隔離記憶。
+
 ## 資料庫探索
 
 使用 `aim_memory_list_stores` 查看所有可用資料庫：

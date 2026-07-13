@@ -43,3 +43,9 @@ export const FILE_MARKER = {
   type: "_aim",
   source: "mcp-knowledge-graph"
 };
+
+// Workspace-only 嚴格模式：啟用後，每次工具呼叫都必須提供明確的 projectRoot，
+// 全域儲存被停用，讀取／寫入／列表一律限縮在 <projectRoot>/.aim/ 之內。
+// 透過 `--workspace-only` 旗標或 AIM_WORKSPACE_ONLY=true 環境變數啟用。
+export const workspaceOnly: boolean =
+  argv['workspace-only'] === true || process.env.AIM_WORKSPACE_ONLY === 'true';

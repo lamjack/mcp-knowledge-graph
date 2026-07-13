@@ -3,7 +3,7 @@
 import { promises as fs } from 'fs';
 import { existsSync, statSync } from 'fs';
 import path, { isAbsolute } from 'path';
-import { baseMemoryPath, FILE_MARKER } from './config.js';
+import { baseMemoryPath, FILE_MARKER, workspaceOnly as configWorkspaceOnly } from './config.js';
 
 // `context` 值的允許格式。context 會被插入檔名
 // （`memory-${context}.jsonl`），因此絕不能包含路徑分隔符或目錄穿越段。
@@ -87,12 +87,23 @@ export function findProjectRoot(startDir: string = process.cwd()): string | null
 
 // 依據 context 與可選的 location 覆蓋取得記憶檔案路徑。
 // 匯出供測試使用：驗證多工作區 projectRoot 路由。
-export function getMemoryFilePath(context?: string, location?: 'project' | 'global', projectRoot?: string): string {
+export function getMemoryFilePath(context?: string, location?: 'project' | 'global', projectRoot?: string, workspaceOnly: boolean = configWorkspaceOnly): string {
   // 在 context 被插入檔名之前驗證，確保穿越攻擊載荷永遠無法到達 path.join。
   if (context !== undefined) {
     assertContextSafe(context);
   }
   const filename = context ? `memory-${context}.jsonl` : 'memory.jsonl';
+
+  // Workspace-only 嚴格模式：強制帶 projectRoot、停用全域儲存，記憶僅限
+  // <projectRoot>/.aim/。缺 projectRoot 或指定 global 一律 fail-closed。
+  if (workspaceOnly) {
+    if (location === 'global') {
+      throw new Error('Workspace-only mode: global storage is disabled. Remove location:"global".');
+    }
+    if (projectRoot === undefined) {
+      throw new Error('Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.');
+    }
+  }
 
   // 明確的 project root 優先於所有其他解析策略。這是多工作區路徑：
   // 用戶端傳入當前工作區根目錄，記憶儲存於 <projectRoot>/.aim/，
@@ -207,6 +218,13 @@ export function formatGraphPretty(graph: KnowledgeGraph, context?: string): stri
 
 // KnowledgeGraphManager 類別包含所有與知識圖譜互動的操作
 export class KnowledgeGraphManager {
+  // Workspace-only 嚴格模式旗標。預設取自執行時配置，可由建構子覆寫（供測試）。
+  private readonly workspaceOnly: boolean;
+
+  constructor(workspaceOnly: boolean = configWorkspaceOnly) {
+    this.workspaceOnly = workspaceOnly;
+  }
+
   // 每個檔案的 Promise 鏈。將同一檔案的讀取-修改-寫入操作序列化，
   // 避免並發工具呼叫遺失彼此的更新。這很重要，因為單一伺服器行程跨工作區共享。
   private writeChains = new Map<string, Promise<unknown>>();
@@ -221,7 +239,7 @@ export class KnowledgeGraphManager {
   }
 
   private async loadGraph(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
-    const filePath = getMemoryFilePath(context, location, projectRoot);
+    const filePath = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
 
     try {
       const data = await fs.readFile(filePath, "utf-8");
@@ -280,7 +298,7 @@ export class KnowledgeGraphManager {
   }
 
   private async saveGraph(graph: KnowledgeGraph, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const filePath = getMemoryFilePath(context, location, projectRoot);
+    const filePath = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
 
     const lines = [
       JSON.stringify(FILE_MARKER),
@@ -309,7 +327,7 @@ export class KnowledgeGraphManager {
   }
 
   async createEntities(entities: Entity[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Entity[]> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
@@ -320,7 +338,7 @@ export class KnowledgeGraphManager {
   }
 
   async createRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Relation[]> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       const newRelations = relations.filter(r => !graph.relations.some(existingRelation =>
@@ -335,7 +353,7 @@ export class KnowledgeGraphManager {
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       const results = observations.map(o => {
@@ -353,7 +371,7 @@ export class KnowledgeGraphManager {
   }
 
   async deleteEntities(entityNames: string[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
@@ -363,7 +381,7 @@ export class KnowledgeGraphManager {
   }
 
   async deleteObservations(deletions: { entityName: string; observations: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       deletions.forEach(d => {
@@ -377,7 +395,7 @@ export class KnowledgeGraphManager {
   }
 
   async deleteRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot);
+    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
     return this.runExclusive(key, async () => {
       const graph = await this.loadGraph(context, location, projectRoot);
       graph.relations = graph.relations.filter(r => !relations.some(delRelation =>
@@ -448,6 +466,31 @@ export class KnowledgeGraphManager {
       global_databases: [] as string[],
       current_location: ""
     };
+
+    // Workspace-only 嚴格模式：強制帶 projectRoot、僅列本 workspace，永不觸及全域。
+    if (this.workspaceOnly) {
+      if (projectRoot === undefined) {
+        throw new Error('Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.');
+      }
+      assertProjectRootSafe(projectRoot);
+      const aimDir = path.join(projectRoot, '.aim');
+      if (existsSync(aimDir)) {
+        result.current_location = `workspace-only (${aimDir})`;
+        try {
+          const files = await fs.readdir(aimDir);
+          result.project_databases = files
+            .filter(file => file.endsWith('.jsonl'))
+            .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
+            .sort();
+        } catch (error) {
+          // 目錄存在但無法讀取 — 忽略
+        }
+      } else {
+        result.current_location = `workspace-only (no .aim directory yet in ${projectRoot})`;
+      }
+      // 全域資料庫在嚴格模式下一律不暴露。
+      return result;
+    }
 
     // 解析專案本地根目錄：明確的、呼叫端傳入的 projectRoot 優先
     // （多工作區），否則回退至基於 cwd 的自動偵測。

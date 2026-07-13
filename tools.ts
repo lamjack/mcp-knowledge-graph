@@ -1,11 +1,12 @@
 // MCP 工具 schema 定義。共享屬性片段只宣告一次（DRY），跨工具重複使用。
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { workspaceOnly } from "./config.js";
 
 // 共享的 input-schema 屬性片段（單一真實來源）。
 const projectRootProp = {
   type: "string",
-  description: "Optional absolute path to the current workspace/project root. When set, memory is stored in <projectRoot>/.aim/ (created if needed), overriding auto-detection. Use this in multi-workspace IDEs (e.g. Windsurf) where the server's working directory is not the project root. Must be an absolute path."
+  description: "Optional absolute path to the current workspace/project root. When set, memory is stored in <projectRoot>/.aim/ (created if needed), overriding auto-detection. Use this in multi-workspace IDEs (e.g. Windsurf) where the server's working directory is not the project root. Must be an absolute path. REQUIRED when the server runs with --workspace-only."
 };
 
 const locationProp = {
@@ -396,3 +397,12 @@ EXAMPLES:
     },
   },
 ];
+
+// Workspace-only 嚴格模式下，projectRoot 對每個工具都是必填。將其反映到對外
+// 公告的 schema，讓 client 能提示使用者（實際的執行時強制在 storage.ts）。
+if (workspaceOnly) {
+  for (const tool of TOOL_DEFINITIONS) {
+    const schema = tool.inputSchema as { required?: string[] };
+    schema.required = Array.from(new Set([...(schema.required ?? []), "projectRoot"]));
+  }
+}
