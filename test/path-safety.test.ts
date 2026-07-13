@@ -1,19 +1,20 @@
-// Regression tests for the path-traversal hardening in getMemoryFilePath.
+// getMemoryFilePath 路徑穿越防護的回歸測試。
 //
-// These cover the vulnerability reported in issue #21: a `context` value was
-// interpolated raw into a filename (`memory-${context}.jsonl`) with no
-// validation, allowing `../` traversal to escape the configured storage
-// directory on the create/save path.
+// 涵蓋 issue #21 回報的漏洞：`context` 值未經驗證就直接插入檔名
+// （`memory-${context}.jsonl`），允許 `../` 穿越逃離設定的儲存目錄，
+// 在建立/儲存路徑上造成安全風險。
 //
-// Run with: npm test  (builds, then runs the compiled tests with node:test).
+// 執行方式：npm test（先編譯，再以 node:test 執行編譯後的測試）。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 
-// Imported from the compiled module. The server's main() is guarded so importing
-// here does not start a stdio transport.
-import { assertContextSafe, assertInScope } from '../index.js';
+// 從編譯後的模組匯入。伺服器的 main() 有守衛，
+// 因此在此匯入不會啟動 stdio transport。
+import { assertContextSafe, assertInScope, assertProjectRootSafe, getMemoryFilePath } from '../index.js';
 
 test('assertContextSafe accepts ordinary context identifiers', () => {
   for (const ok of ['work', 'personal', 'health', 'project_2024', 'a-b.c', 'A1']) {
@@ -34,16 +35,16 @@ test('assertContextSafe rejects traversal segments', () => {
 });
 
 test('assertContextSafe rejects the issue #21 payload', () => {
-  // The reporter's traversal example: enough ../ to reach an arbitrary
-  // process-writable location. The slash makes this fail outright.
+  // 回報者的穿越範例：足夠的 ../ 到達任意行程可寫入位置。
+  // 斜線使其直接失敗。
   assert.throws(() => assertContextSafe('../../../../tmp/pwned'), /path separators/);
 });
 
 test('assertContextSafe rejects empty and non-string input', () => {
   assert.throws(() => assertContextSafe(''), /non-empty string/);
-  // @ts-expect-error intentional misuse for runtime guard coverage
+  // @ts-expect-error 刻意誤用以覆蓋執行時防護
   assert.throws(() => assertContextSafe(undefined), /non-empty string/);
-  // @ts-expect-error intentional misuse for runtime guard coverage
+  // @ts-expect-error 刻意誤用以覆蓋執行時防護
   assert.throws(() => assertContextSafe(123), /non-empty string/);
 });
 
@@ -73,4 +74,60 @@ test('assertInScope rejects the base directory itself', () => {
 test('assertInScope rejects an absolute path outside base', () => {
   const base = path.resolve('/tmp/kg-base');
   assert.throws(() => assertInScope('/etc/passwd', base), /escapes the configured storage directory/);
+});
+
+// assertProjectRootSafe 守護多工作區的 `projectRoot` 參數。
+// 在 Windsurf 等用戶端中，伺服器的 cwd 不可靠，因此用戶端
+// 明確傳入工作區根目錄；我們只接受已存在的絕對路徑目錄，
+// 以避免歧義與散落的 `.aim` 目錄建立。
+
+test('assertProjectRootSafe accepts an existing absolute directory', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'kg-root-'));
+  assert.doesNotThrow(() => assertProjectRootSafe(dir));
+});
+
+test('assertProjectRootSafe rejects relative paths', () => {
+  for (const bad of ['relative/dir', './here', '../up']) {
+    assert.throws(() => assertProjectRootSafe(bad), /absolute path/, `expected "${bad}" to be rejected`);
+  }
+});
+
+test('assertProjectRootSafe rejects empty and non-string input', () => {
+  assert.throws(() => assertProjectRootSafe(''), /non-empty string/);
+  // @ts-expect-error 刻意誤用以覆蓋執行時防護
+  assert.throws(() => assertProjectRootSafe(undefined), /non-empty string/);
+  // @ts-expect-error 刻意誤用以覆蓋執行時防護
+  assert.throws(() => assertProjectRootSafe(123), /non-empty string/);
+});
+
+test('assertProjectRootSafe rejects a non-existent absolute path', () => {
+  const missing = path.join(os.tmpdir(), `kg-does-not-exist-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  assert.throws(() => assertProjectRootSafe(missing), /does not exist/);
+});
+
+test('assertProjectRootSafe rejects a path that is a file, not a directory', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'kg-root-'));
+  const file = path.join(dir, 'not-a-dir.txt');
+  writeFileSync(file, 'hello');
+  assert.throws(() => assertProjectRootSafe(file), /not a directory/);
+});
+
+// 核心多工作區路由：明確的 projectRoot 必須解析至
+// 該 repo 專屬的 `.aim/` 目錄，不受伺服器 cwd 影響。
+
+test('getMemoryFilePath routes a projectRoot to <projectRoot>/.aim/memory.jsonl', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'kg-ws-'));
+  const resolved = getMemoryFilePath(undefined, undefined, root);
+  assert.equal(resolved, path.join(root, '.aim', 'memory.jsonl'));
+});
+
+test('getMemoryFilePath routes a projectRoot + context to a suffixed file', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'kg-ws-'));
+  const resolved = getMemoryFilePath('work', undefined, root);
+  assert.equal(resolved, path.join(root, '.aim', 'memory-work.jsonl'));
+});
+
+test('getMemoryFilePath with projectRoot still rejects a traversal context', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'kg-ws-'));
+  assert.throws(() => getMemoryFilePath('../../etc/pwned', undefined, root), /path separators/);
 });
