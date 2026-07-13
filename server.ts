@@ -31,12 +31,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOL_DEFINITIONS };
 });
 
+// 依工具 schema 的 required 檢查必要參數是否存在，提供比下游 TypeError
+// 更清楚的錯誤訊息。projectRoot 交由 storage 層處理（其訊息更具指引性），
+// 這裡略過以免蓋掉 workspace-only 的專屬提示。
+function assertRequiredArgs(toolName: string, args: Record<string, unknown>): void {
+  const tool = TOOL_DEFINITIONS.find(t => t.name === toolName);
+  const required = (tool?.inputSchema as { required?: string[] }).required ?? [];
+  const missing = required.filter(key => key !== 'projectRoot' && args[key] === undefined);
+  if (missing.length > 0) {
+    throw new Error(`Missing required argument(s) for ${toolName}: ${missing.join(', ')}`);
+  }
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (!args) {
     throw new Error(`No arguments provided for tool: ${name}`);
   }
+
+  assertRequiredArgs(name, args as Record<string, unknown>);
 
   switch (name) {
     case "aim_memory_store":
