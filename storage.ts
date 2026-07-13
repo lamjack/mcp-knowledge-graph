@@ -234,13 +234,25 @@ export class KnowledgeGraphManager {
     // 無論前一個任務是 resolve 還是 reject 都執行。
     const run = prev.then(task, task);
     // 保持鏈存活但吞掉結算結果，確保單次失敗不會鎖死整個鏈。
-    this.writeChains.set(key, run.then(() => undefined, () => undefined));
+    const settled = run.then(() => undefined, () => undefined);
+    this.writeChains.set(key, settled);
+    // 鏈閒置後清理該 key，避免長生命週期、跨工作區的伺服器無限累積條目。
+    // 僅在期間沒有新任務接上（仍是同一個 settled）時才刪除，確保並發安全。
+    void settled.then(() => {
+      if (this.writeChains.get(key) === settled) {
+        this.writeChains.delete(key);
+      }
+    });
     return run;
   }
 
-  private async loadGraph(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
-    const filePath = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
+  // 依當前嚴格模式解析單一記憶檔案路徑（含 workspace-only 驗證）。
+  // 每個公開操作只解析一次，避免同一次操作重複執行 statSync 與路徑驗證。
+  private resolvePath(context?: string, location?: 'project' | 'global', projectRoot?: string): string {
+    return getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
+  }
 
+  private async loadGraph(filePath: string): Promise<KnowledgeGraph> {
     try {
       const data = await fs.readFile(filePath, "utf-8");
       const lines = data.split("\n").filter(line => line.trim() !== "");
@@ -297,9 +309,7 @@ export class KnowledgeGraphManager {
     }
   }
 
-  private async saveGraph(graph: KnowledgeGraph, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const filePath = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-
+  private async saveGraph(graph: KnowledgeGraph, filePath: string): Promise<void> {
     const lines = [
       JSON.stringify(FILE_MARKER),
       ...graph.entities.map(e => JSON.stringify({ type: "entity", ...e })),
@@ -327,35 +337,35 @@ export class KnowledgeGraphManager {
   }
 
   async createEntities(entities: Entity[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Entity[]> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
       graph.entities.push(...newEntities);
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
       return newEntities;
     });
   }
 
   async createRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Relation[]> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       const newRelations = relations.filter(r => !graph.relations.some(existingRelation =>
         existingRelation.from === r.from &&
         existingRelation.to === r.to &&
         existingRelation.relationType === r.relationType
       ));
       graph.relations.push(...newRelations);
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
       return newRelations;
     });
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       const results = observations.map(o => {
         const entity = graph.entities.find(e => e.name === o.entityName);
         if (!entity) {
@@ -365,55 +375,55 @@ export class KnowledgeGraphManager {
         entity.observations.push(...newObservations);
         return { entityName: o.entityName, addedObservations: newObservations };
       });
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
       return results;
     });
   }
 
   async deleteEntities(entityNames: string[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
       graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
     });
   }
 
   async deleteObservations(deletions: { entityName: string; observations: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       deletions.forEach(d => {
         const entity = graph.entities.find(e => e.name === d.entityName);
         if (entity) {
           entity.observations = entity.observations.filter(o => !d.observations.includes(o));
         }
       });
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
     });
   }
 
   async deleteRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
-    const key = getMemoryFilePath(context, location, projectRoot, this.workspaceOnly);
-    return this.runExclusive(key, async () => {
-      const graph = await this.loadGraph(context, location, projectRoot);
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
       graph.relations = graph.relations.filter(r => !relations.some(delRelation =>
         r.from === delRelation.from &&
         r.to === delRelation.to &&
         r.relationType === delRelation.relationType
       ));
-      await this.saveGraph(graph, context, location, projectRoot);
+      await this.saveGraph(graph, filePath);
     });
   }
 
   async readGraph(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
-    return this.loadGraph(context, location, projectRoot);
+    return this.loadGraph(this.resolvePath(context, location, projectRoot));
   }
 
   // 非常基礎的搜尋函式
   async searchNodes(query: string, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph(context, location, projectRoot);
+    const graph = await this.loadGraph(this.resolvePath(context, location, projectRoot));
 
     // 篩選實體
     const filteredEntities = graph.entities.filter(e =>
@@ -439,7 +449,7 @@ export class KnowledgeGraphManager {
   }
 
   async openNodes(names: string[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph(context, location, projectRoot);
+    const graph = await this.loadGraph(this.resolvePath(context, location, projectRoot));
 
     // 篩選實體
     const filteredEntities = graph.entities.filter(e => names.includes(e.name));
