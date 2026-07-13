@@ -55,6 +55,10 @@ coverage/
 *.jsonl
 !example*.jsonl
 
+# Workspace-local memory directory, including atomic-write temp files
+# (.aim/.memory.jsonl.tmp-<pid>-<ts>) that do not match the *.jsonl rule above.
+.aim/
+
 # Local documentation
 PUBLISHING.md
 VERSION_UPDATE.md
