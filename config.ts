@@ -11,8 +11,10 @@ import minimist from 'minimist';
 const require = createRequire(import.meta.url);
 export const pkg = require('../package.json') as { version: string; name: string };
 
-// 解析參數並安全處理路徑。
-const argv = minimist(process.argv.slice(2));
+// 解析參數並安全處理路徑。將 workspace-only 宣告為布林旗標，讓 minimist
+// 一致處理 `--workspace-only`、`--workspace-only=true/false`、`--no-workspace-only`，
+// 避免 `--workspace-only true` 被解析成字串而靜默停用嚴格模式。
+const argv = minimist(process.argv.slice(2), { boolean: ['workspace-only'] });
 let memoryPath = argv['memory-path'];
 
 // 若提供了自訂路徑，確保其為絕對路徑。

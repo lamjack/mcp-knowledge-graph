@@ -398,11 +398,21 @@ EXAMPLES:
   },
 ];
 
-// Workspace-only 嚴格模式下，projectRoot 對每個工具都是必填。將其反映到對外
-// 公告的 schema，讓 client 能提示使用者（實際的執行時強制在 storage.ts）。
+// Workspace-only 嚴格模式：對外公告的 schema 需與執行時的 fail-closed 行為一致，
+// 否則模型會照著描述送出被拒絕的 global 呼叫。因此在此模式下：
+//   1. 將 projectRoot 標記為每個工具必填（提示層；實際強制在 storage.ts）。
+//   2. 移除 location 屬性 —— global 被停用、project 在有 projectRoot 時多餘。
+//   3. 於描述最前面加註，讓模型忽略下方任何 global/location 範例。
 if (workspaceOnly) {
+  const note =
+    "[workspace-only mode] Always pass projectRoot set to the current workspace's absolute root path. " +
+    "Global storage and the 'location' parameter are disabled in this mode; ignore any 'global'/'location' examples below.\n\n";
   for (const tool of TOOL_DEFINITIONS) {
-    const schema = tool.inputSchema as { required?: string[] };
+    const schema = tool.inputSchema as { required?: string[]; properties?: Record<string, unknown> };
     schema.required = Array.from(new Set([...(schema.required ?? []), "projectRoot"]));
+    if (schema.properties) {
+      delete schema.properties.location;
+    }
+    tool.description = note + (tool.description ?? "");
   }
 }
