@@ -1,0 +1,17 @@
+{
+  // Editor-only project: the root tsconfig.json excludes `test/` (so `npm run build`
+  // never emits tests into dist/), which leaves editors unable to type-check test files
+  // and causes false "Cannot find name 'node:fs'" / implicit-any errors. This config lets
+  // the TypeScript language server resolve test files with the same NodeNext + @types/node
+  // settings the CLI uses. Compilation for `npm test` still goes through ../tsconfig.test.json.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    "declaration": false,
+    "checkJs": false
+  },
+  "include": ["./**/*.ts"],
+  // Override the base `exclude` (which lists "test") so this project can see its own files.
+  "exclude": ["../node_modules", "../dist"]
+}

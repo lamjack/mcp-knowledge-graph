@@ -1,0 +1,12 @@
+{
+  // Build project used by `npm run build` / `npm run prepare`. It mirrors the root
+  // tsconfig.json but excludes `test/` so compiled tests are never emitted into dist/
+  // (which is what gets published via package.json "files": ["dist"]).
+  // The root tsconfig.json intentionally includes test/ so editors type-check test files.
+  "extends": "./tsconfig.json",
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test"
+  ]
+}

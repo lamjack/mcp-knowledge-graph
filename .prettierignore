@@ -1,0 +1,31 @@
+# Build output
+dist/
+*.tsbuildinfo
+
+# Generated / lockfiles
+package-lock.json
+
+# Memory & data files (JSON Lines, not formatted by Prettier)
+*.jsonl
+
+# Coverage
+coverage/
+
+# --- Grandfathered existing files ---
+# These predate Prettier adoption and are intentionally left unformatted for now.
+# New files are NOT listed here, so they will be checked/formatted by Prettier.
+# To format one of these, remove it from this list and run `npm run format`.
+config.ts
+index.ts
+server.ts
+storage.ts
+tools.ts
+test/path-safety.test.ts
+test/search.test.ts
+test/server-cli.test.ts
+test/storage.test.ts
+test/workspace-only.test.ts
+tsconfig.json
+tsconfig.build.json
+tsconfig.test.json
+README.md
