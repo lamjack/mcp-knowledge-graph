@@ -17,8 +17,8 @@ const locationProp = {
 
 const formatProp = {
   type: "string",
-  enum: ["json", "pretty"],
-  description: "Output format. 'json' (default) for structured data, 'pretty' for human-readable text."
+  enum: ["json", "pretty", "concise"],
+  description: "Output format. 'json' (default) for structured data, 'pretty' for human-readable text, 'concise' for a token-efficient one-line-per-entity form (best for feeding results back into an LLM context)."
 };
 
 export const TOOL_DEFINITIONS: Tool[] = [
@@ -329,6 +329,14 @@ EXAMPLES:
         },
         location: locationProp,
         query: { type: "string", description: "Search text to match against entity names, entity types, and observation content (case-insensitive)" },
+        limit: {
+          type: "number",
+          description: "Optional cap on the number of highest-ranked matching entities (seeds) to return. Results are ranked by relevance (exact name > name substring > type > observation). Neighbours pulled in by 'depth' do not count against this cap. Omit to return all matches."
+        },
+        depth: {
+          type: "number",
+          description: "Optional number of relationship hops to expand from each matched entity, pulling in connected neighbours for context (default 1). Use 0 to return only the matched entities and the relations strictly between them."
+        },
         format: formatProp,
       },
       required: ["query"],

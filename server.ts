@@ -12,10 +12,20 @@ import { pkg } from './config.js';
 import {
   knowledgeGraphManager,
   formatGraphPretty,
+  formatGraphConcise,
+  type KnowledgeGraph,
   type Entity,
   type Relation,
 } from './storage.js';
 import { TOOL_DEFINITIONS } from './tools.js';
+
+// 依 format 參數序列化圖譜。'concise' 為 token 精簡格式，'pretty' 為人類可讀，
+// 其餘（含未指定）一律回退到結構化 JSON，維持既有預設行為。
+function formatGraph(graph: KnowledgeGraph, format: unknown, context?: string): string {
+  if (format === 'pretty') return formatGraphPretty(graph, context);
+  if (format === 'concise') return formatGraphConcise(graph, context);
+  return JSON.stringify(graph, null, 2);
+}
 
 // 伺服器實例與公開給 AI 模型的工具
 export const server = new Server({
@@ -70,24 +80,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "aim_memory_read_all": {
       const graph = await knowledgeGraphManager.readGraph(args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
-      const output = args.format === 'pretty'
-        ? formatGraphPretty(graph, args.context as string)
-        : JSON.stringify(graph, null, 2);
-      return { content: [{ type: "text", text: output }] };
+      return { content: [{ type: "text", text: formatGraph(graph, args.format, args.context as string) }] };
     }
     case "aim_memory_search": {
-      const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
-      const output = args.format === 'pretty'
-        ? formatGraphPretty(graph, args.context as string)
-        : JSON.stringify(graph, null, 2);
-      return { content: [{ type: "text", text: output }] };
+      const graph = await knowledgeGraphManager.searchNodes(
+        args.query as string,
+        args.context as string,
+        args.location as 'project' | 'global',
+        args.projectRoot as string,
+        { limit: args.limit as number | undefined, depth: args.depth as number | undefined },
+      );
+      return { content: [{ type: "text", text: formatGraph(graph, args.format, args.context as string) }] };
     }
     case "aim_memory_get": {
       const graph = await knowledgeGraphManager.openNodes(args.names as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
-      const output = args.format === 'pretty'
-        ? formatGraphPretty(graph, args.context as string)
-        : JSON.stringify(graph, null, 2);
-      return { content: [{ type: "text", text: output }] };
+      return { content: [{ type: "text", text: formatGraph(graph, args.format, args.context as string) }] };
     }
     case "aim_memory_list_stores":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(args.projectRoot as string), null, 2) }] };

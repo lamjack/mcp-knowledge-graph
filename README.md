@@ -168,6 +168,22 @@ my-project/
 - `context`（可選）— 指定命名資料庫（`work`、`personal` 等）。預設為主資料庫
 - `projectRoot`（**`--workspace-only` 下必填**）— 當前 workspace/專案根目錄的絕對路徑，記憶儲存於 `<projectRoot>/.aim/`
 - `location`（可選）— 強制儲存位置。`--workspace-only` 模式下僅接受 `project`，`global` 會被拒絕
+- `format`（可選，讀取類工具）— 輸出格式：`json`（預設，結構化）、`pretty`（人類可讀）、`concise`（token 精簡，單行一實體，最適合回填大模型 context）
+- `limit`（可選，`aim_memory_search`）— 只回傳相關性最高的前 N 個命中實體（seeds）。相關性排序：name 完全命中 > name 子字串 > type > observation。由 `depth` 帶入的鄰居不計入此上限
+- `depth`（可選，`aim_memory_search`，預設 `1`）— 由每個命中實體向外擴展的關係跳數，帶入鄰居提供脈絡。設為 `0` 只回傳命中實體與其之間的關係
+
+### 搜尋行為（相關性排序 + ego-graph 擴展）
+
+`aim_memory_search` 會對每個實體評分後依相關性排序，並預設擴展 1 跳鄰居，確保命中實體的關係與上下文不被丟棄（即使鄰居本身未命中關鍵字）。搭配 `limit` 可只取 top-k、搭配 `format:"concise"` 可大幅降低回填 context 的 token 量。
+
+**多詞查詢（分詞比對）**：查詢含多個詞（以空白/標點分隔）時，會分別比對各詞，只要 name/type/observation 命中其中任一詞即計分：
+
+- **詞覆蓋**：命中越多不同查詢詞的實體排序越前（例如查 `seattle trip`，同時含 `trip` 與 `seattle` 者優先於只含其一者）。
+- **整詞權重**：整詞命中（word-boundary）權重高於中段子字串（`cat` 這個完整詞 > `category` 中的 `cat`）。
+- **IDF 加權**：出現在越多實體的通用詞權重越低、稀有詞越高（例如查 `lamtrade timezone`，`lamtrade` 幾乎人人有 → 由 `timezone` 主導排序，timezone 相關實體浮上前列）。
+- **長度正規化**：observation 越多的實體，單則命中的邊際貢獻越低，避免長 hub 純靠「命中數量」霸榜。
+- **typo 容忍（fuzzy fallback）**：某個查詢詞在語料中**完全無精確子字串命中**且長度 ≥4 時，才啟用受限編輯距離近似比對（長度 ≥7 容許 2 個編輯，否則 1 個），修正拼寫錯誤（例：`kubernets`→`kubernetes`、`compresion`→`compression`）。已可精確命中者不觸發，避免雜訊。
+- **向後相容**：單詞查詢維持原有分層（name 完全命中 > name 子字串 > type > observation），行為不變。
 
 ## 多工作區支援
 
