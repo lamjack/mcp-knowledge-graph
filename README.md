@@ -94,6 +94,17 @@ dist/
 - 系統拒絕寫入不含此標記的檔案
 - 防止誤覆寫無關的 JSONL 檔案
 
+### 持久化語義（per-operation read-modify-write + 讀取快取）
+
+每次工具呼叫都是獨立的 **read-modify-write**：
+
+1. 讀取（或重用快取）當前 JSONL → 2. 在記憶體中修改 → 3. 以暫存檔 + `rename()` 原子寫回整個檔案。
+
+- **同檔操作序列化**：同一檔案的並發呼叫會排隊執行，避免彼此覆寫（跨 workspace 的單一伺服器行程尤其重要）。
+- **原子寫入**：先寫 `.tmp` 再 `rename`（同檔案系統上為原子操作），寫入中途崩潰不會留下截斷/損壞的記憶檔。
+- **讀取快取**：已解析的圖譜以 **`mtime`（nanosecond 精度）+ `size`** 為鍵快取，純為效能優化。任何不一致都會退回重新讀檔並重新解析；快取只回傳深拷貝，呼叫端無法透過回傳值污染快取。
+- **外部直接編輯 JSONL 是安全的**：因為快取以 `mtime + size` 失效，你在伺服器外手動編輯 `.aim/*.jsonl`（並保留首行 `_aim` 標記）後，下一次操作會偵測到檔案變動並重新載入，不會復活你刪掉的資料，也不會讀到陳舊快取。（極端情況：若在**同一時間戳**內把檔案改成**完全相同的位元組長度**，理論上可能命中舊快取；一般手動編輯不會遇到。）
+
 ## 使用方式
 
 ### 資料庫概念
@@ -152,9 +163,9 @@ my-project/
 
 ## 可用工具
 
-- `aim_memory_store` — 儲存新記憶（人物、專案、概念）
+- `aim_memory_store` — 儲存新記憶（人物、專案、概念）。若新 `entityType` 與既有型別僅差大小寫/底線/連字符，回傳會附 `warnings`（不阻斷寫入）
 - `aim_memory_add_facts` — 向既有記憶新增事實
-- `aim_memory_link` — 連結兩個記憶
+- `aim_memory_link` — 連結兩個記憶。**預設對不存在的端點報錯**（防幽靈節點）；傳 `allowDangling:true` 可還原舊的寬鬆行為
 - `aim_memory_search` — 依關鍵字搜尋記憶
 - `aim_memory_get` — 依確切名稱擷取特定記憶
 - `aim_memory_read_all` — 讀取資料庫中所有記憶
@@ -162,6 +173,13 @@ my-project/
 - `aim_memory_forget` — 遺忘記憶
 - `aim_memory_remove_facts` — 移除記憶中的特定事實
 - `aim_memory_unlink` — 移除記憶之間的連結
+
+### 策展與防呆工具
+
+- `aim_memory_update_entity` — **原地**更新實體：改名與/或改 `entityType`，保留 observations（順序不變）。改名會連帶重寫所有 relation 的 `from`/`to` 端點；改名撞到既有名稱則報錯不覆蓋。避免「forget → store → 重新 link」的轉錄風險。參數：`name`（必填）、`newName?`、`entityType?`（後兩者至少給一個）
+- `aim_memory_replace_fact` — 原子「刪舊補新」：刪除某實體所有命中（`matchPrefix` 或 `matchSubstring` 二擇一）的 observation，並在**同一次寫入**追加 `newText`。回傳 `{matched, replaced}`；0 命中時不追加並回傳 `{matched:0, replaced:false}`（不靜默 no-op）。適合取代 key 型 observation（如「開發計畫編號: ...」）。參數：`entityName`、`newText`（必填）、`matchPrefix?`/`matchSubstring?`（恰一）
+- `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 `:` key 前綴的多條 observation）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
+- `aim_memory_list_entity_types` — 唯讀，回傳各 `entityType` 與其實體計數（數量多者在前），供型別詞彙治理
 
 ### 參數
 
@@ -171,6 +189,8 @@ my-project/
 - `format`（可選，讀取類工具）— 輸出格式：`json`（預設，結構化）、`pretty`（人類可讀）、`concise`（token 精簡，單行一實體，最適合回填大模型 context）
 - `limit`（可選，`aim_memory_search`）— 只回傳相關性最高的前 N 個命中實體（seeds）。相關性排序：name 完全命中 > name 子字串 > type > observation。由 `depth` 帶入的鄰居不計入此上限
 - `depth`（可選，`aim_memory_search`，預設 `1`）— 由每個命中實體向外擴展的關係跳數，帶入鄰居提供脈絡。設為 `0` 只回傳命中實體與其之間的關係
+- `includeObservations`（可選，`aim_memory_read_all` / `aim_memory_get`，預設 `true`）— 設為 `false` 時只回傳每個 entity 的 `name` + `entityType`（省略 observations）與完整關係骨架，供審計/索引大圖時避免數百 KB 輸出被截斷
+- `allowDangling`（可選，`aim_memory_link`，預設 `false`）— 逃生門。預設會拒絕指向不存在端點的連結；設 `true` 允許建立端點尚不存在的關係（舊寬鬆行為）
 
 ### 搜尋行為（相關性排序 + ego-graph 擴展）
 
@@ -291,7 +311,9 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
         "aim_memory_search",
         "aim_memory_get",
         "aim_memory_read_all",
-        "aim_memory_list_stores"
+        "aim_memory_list_stores",
+        "aim_memory_doctor",
+        "aim_memory_list_entity_types"
       ]
     }
   }

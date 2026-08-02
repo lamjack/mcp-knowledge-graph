@@ -21,6 +21,11 @@ const formatProp = {
   description: "Output format. 'json' (default) for structured data, 'pretty' for human-readable text, 'concise' for a token-efficient one-line-per-entity form (best for feeding results back into an LLM context)."
 };
 
+const includeObservationsProp = {
+  type: "boolean",
+  description: "Optional. Defaults to true (observations included). When false, returns only each entity's name + entityType (observations omitted) plus the full relation skeleton - useful for auditing/indexing large graphs without emitting hundreds of KB that would be truncated."
+};
+
 export const TOOL_DEFINITIONS: Tool[] = [
   {
     name: "aim_memory_store",
@@ -86,7 +91,7 @@ RELATION STRUCTURE: Each link has 'from' (subject), 'relationType' (verb), and '
 - Read as: "from relationType to" (e.g., "Alice manages Q4_Project")
 - Avoid passive: use "manages" not "is_managed_by"
 
-IMPORTANT: Both 'from' and 'to' entities must already exist in the same database.
+IMPORTANT: Both 'from' and 'to' entities must already exist in the same database. By default, linking to a non-existent endpoint is REJECTED (prevents dangling/ghost edges); the error lists the missing endpoints. Pass allowDangling:true only if you deliberately want an edge to an entity you will create later.
 
 RETURNS: Array of created relations (duplicates are ignored).
 
@@ -116,6 +121,10 @@ EXAMPLES:
             },
             required: ["from", "to", "relationType"],
           },
+        },
+        allowDangling: {
+          type: "boolean",
+          description: "Optional escape hatch (default false). By default, linking to a non-existent 'from'/'to' entity is rejected to prevent dangling edges. Set true to allow creating relations whose endpoints do not yet exist (legacy permissive behavior)."
         },
       },
       required: ["relations"],
@@ -297,6 +306,7 @@ EXAMPLES:
         },
         location: locationProp,
         format: formatProp,
+        includeObservations: includeObservationsProp,
       },
     },
   },
@@ -373,6 +383,7 @@ EXAMPLES:
           description: "An array of entity names to retrieve",
         },
         format: formatProp,
+        includeObservations: includeObservationsProp,
       },
       required: ["names"],
     },
@@ -401,6 +412,120 @@ EXAMPLES:
           type: "string",
           description: "Optional absolute path to the current workspace/project root. When set, lists databases in <projectRoot>/.aim/ instead of the auto-detected project. Use this in multi-workspace IDEs (e.g. Windsurf). Must be an absolute path."
         }
+      },
+    },
+  },
+  {
+    name: "aim_memory_update_entity",
+    description: `Update a memory entity in place: rename it and/or change its entityType, without losing observations.
+
+WHY: Renaming or retyping via forget + re-store would drop the entity's relations and force re-transcribing every observation. This tool preserves observations (order unchanged) and, on rename, rewrites every relation endpoint (from/to) that pointed at the old name.
+
+RULES:
+- Provide at least one of newName or entityType.
+- Renaming onto a name that already exists is rejected (no overwrite).
+- The target entity must exist.
+
+RETURNS: The updated entity.
+
+EXAMPLES:
+- Rename: aim_memory_update_entity({name: "OldName", newName: "NewName"})
+- Retype: aim_memory_update_entity({name: "Plan", entityType: "dev-plan"})
+- Both: aim_memory_update_entity({context: "work", name: "Plan", newName: "Q4Plan", entityType: "dev-plan"})`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectRoot: projectRootProp,
+        context: {
+          type: "string",
+          description: "Optional memory context. The entity is updated in the specified context's knowledge graph."
+        },
+        location: locationProp,
+        name: { type: "string", description: "The current name of the entity to update" },
+        newName: { type: "string", description: "Optional new name. On rename, all relation endpoints pointing at the old name are rewritten. Must not collide with an existing entity." },
+        entityType: { type: "string", description: "Optional new entityType." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "aim_memory_replace_fact",
+    description: `Atomically replace matching observations on an entity with a single new observation ("delete old, add new" in one write).
+
+WHY: Key-style observations (e.g. "開發計畫編號: ...") get superseded by newer versions. Doing this by hand needs an exact-string remove_facts + add_facts (two steps); long strings fail to match and silently no-op. This tool deletes ALL observations matching a prefix OR substring and appends newText in the same write.
+
+MATCH: Provide exactly one of matchPrefix or matchSubstring.
+
+RETURNS: {matched: number, replaced: boolean}. If 0 observations match, nothing is appended and it returns {matched: 0, replaced: false} (never a silent no-op). Errors if the entity does not exist.
+
+EXAMPLES:
+- aim_memory_replace_fact({entityName: "Plan", matchPrefix: "開發計畫編號:", newText: "開發計畫編號: v4"})
+- aim_memory_replace_fact({context: "work", entityName: "E", matchSubstring: "status is", newText: "status is green"})`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectRoot: projectRootProp,
+        context: {
+          type: "string",
+          description: "Optional memory context. The observation is replaced within the specified context's knowledge graph."
+        },
+        location: locationProp,
+        entityName: { type: "string", description: "The name of the entity whose observations to replace" },
+        matchPrefix: { type: "string", description: "Delete every observation that starts with this prefix. Provide exactly one of matchPrefix or matchSubstring." },
+        matchSubstring: { type: "string", description: "Delete every observation that contains this substring. Provide exactly one of matchPrefix or matchSubstring." },
+        newText: { type: "string", description: "The single new observation to append after deleting matches." },
+      },
+      required: ["entityName", "newText"],
+    },
+  },
+  {
+    name: "aim_memory_doctor",
+    description: `Read-only graph audit. Reports structural issues in a single database so you can clean them up.
+
+RETURNS an object with:
+- orphans: entity names with no relation at all
+- danglingRelations: relations whose 'from'/'to' endpoint entity does not exist
+- typeCollisions: groups of entityTypes that differ only by case/underscore/hyphen (e.g. dev_plan vs dev-plan vs DevPlan)
+- duplicateCandidates: within one entity, multiple observations sharing the same ':' key prefix (possible stale versions)
+- stats: entity/relation/observation counts and per-entityType distribution for the audited database
+
+This never mutates the graph and never exposes secrets beyond what is already stored.
+
+EXAMPLES:
+- aim_memory_doctor({}) - audit the default database
+- aim_memory_doctor({context: "work"}) - audit the work database`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectRoot: projectRootProp,
+        context: {
+          type: "string",
+          description: "Optional memory context. Audits the specified context's knowledge graph, or the master database if not specified."
+        },
+        location: locationProp,
+      },
+    },
+  },
+  {
+    name: "aim_memory_list_entity_types",
+    description: `Read-only. List every entityType in a database with the number of entities of that type, most frequent first.
+
+Useful for entityType vocabulary governance: spotting near-duplicate or inconsistent types before they proliferate (pair with aim_memory_doctor's typeCollisions).
+
+RETURNS: Array of {entityType, count}.
+
+EXAMPLES:
+- aim_memory_list_entity_types({})
+- aim_memory_list_entity_types({context: "work"})`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectRoot: projectRootProp,
+        context: {
+          type: "string",
+          description: "Optional memory context. Lists entity types from the specified context's knowledge graph, or the master database if not specified."
+        },
+        location: locationProp,
       },
     },
   },

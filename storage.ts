@@ -170,6 +170,32 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
+// createEntities 的回傳：新建立的實體 + entityType 格式治理警告（不阻斷寫入）。
+export interface CreateEntitiesResult {
+  entities: Entity[];
+  warnings: string[];
+}
+
+// aim_memory_doctor 的唯讀審計報告。所有欄位皆為新計算的純資料（不與快取共用參考）。
+export interface DoctorReport {
+  // 無任何 relation 端點的 entity 名單（名稱序）。
+  orphans: string[];
+  // 端點不存在的 relation 清單。
+  danglingRelations: Relation[];
+  // entityType 僅差大小寫/底線/連字符的分組（正規化鍵 -> 原始型別集合）。
+  typeCollisions: { normalized: string; types: string[] }[];
+  // 同一 entity 內共用相同 ':' key 前綴的多條 observations（可能是未清理的過時版本）。
+  duplicateCandidates: { entityName: string; keyPrefix: string; count: number; observations: string[] }[];
+  // 計數與型別分佈統計。
+  stats: {
+    database: string;
+    entityCount: number;
+    relationCount: number;
+    observationCount: number;
+    entityTypeDistribution: Record<string, number>;
+  };
+}
+
 // 判斷 `line` 是否為我們的 `_aim` 安全標記。永不拋出例外（無效 JSON -> false）。
 function isMarkerLine(line: string): boolean {
   try {
@@ -247,6 +273,40 @@ export interface SearchOptions {
 // 用於以 Set 做 O(1) 的關係去重與刪除，取代嵌套線性掃描。
 function relationKey(r: Relation): string {
   return `${r.from}\u0000${r.relationType}\u0000${r.to}`;
+}
+
+// entityType 正規化鍵：小寫並移除底線/連字符，用於偵測「僅差大小寫/底線/連字符」的近似重複型別
+// （如 DevPlan / dev-plan / dev_plan 皆正規化為 devplan）。純比較用途，不改變儲存的原始型別字串。
+function normalizeTypeKey(entityType: string): string {
+  return entityType.toLowerCase().replace(/[_-]/g, '');
+}
+
+// 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
+// 正規化後相同、但原字串不同時，回傳一則提醒（不阻斷寫入）。同批內首次出現的新型別
+// 會被納入已知集合，避免對同批後續相同型別誤報。
+function detectEntityTypeWarnings(existingTypes: Iterable<string>, newEntities: Entity[]): string[] {
+  const known = new Map<string, string>();
+  for (const t of existingTypes) {
+    const k = normalizeTypeKey(t);
+    if (!known.has(k)) known.set(k, t);
+  }
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+  for (const e of newEntities) {
+    const k = normalizeTypeKey(e.entityType);
+    const existing = known.get(k);
+    if (existing === undefined) {
+      // 本批內首次出現此正規化型別 -> 納入 known，讓同批後續同型別不誤報。
+      known.set(k, e.entityType);
+    } else if (existing !== e.entityType) {
+      const dedupeKey = `${e.entityType}\u0000${existing}`;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        warnings.push(`entityType '${e.entityType}' 與既有 '${existing}' 僅差格式，是否應統一？`);
+      }
+    }
+  }
+  return warnings;
 }
 
 // 是否為「詞字元」（unicode 字母或數字）。底線與空白/標點皆視為詞邊界，
@@ -461,23 +521,42 @@ export class KnowledgeGraphManager {
     }
   }
 
-  async createEntities(entities: Entity[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Entity[]> {
+  // 回傳新建立的實體與 entityType 格式治理警告。警告不阻斷寫入（向後相容：呼叫端可忽略 warnings）。
+  async createEntities(entities: Entity[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<CreateEntitiesResult> {
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {
       const graph = await this.loadGraph(filePath);
       // O(N+k) 去重：先建現有名稱 Set，取代 filter 內嵌套 .some 的 O(k·N)。
       const existingNames = new Set(graph.entities.map(e => e.name));
       const newEntities = entities.filter(e => !existingNames.has(e.name));
+      // 只對「真正新建立」的實體比對既有型別，避免對被去重忽略的重複實體誤報。
+      const warnings = detectEntityTypeWarnings(graph.entities.map(e => e.entityType), newEntities);
       graph.entities.push(...newEntities);
       await this.saveGraph(graph, filePath);
-      return newEntities;
+      return { entities: newEntities, warnings };
     });
   }
 
-  async createRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Relation[]> {
+  // 建立關係。預設對不存在的端點 fail-closed（防幽靈節點），錯誤列出所有缺失端點且不寫檔；
+  // 傳 allowDangling:true 作為逃生門可還原舊行為（允許懸空邊）。
+  async createRelations(relations: Relation[], context?: string, location?: 'project' | 'global', projectRoot?: string, allowDangling: boolean = false): Promise<Relation[]> {
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {
       const graph = await this.loadGraph(filePath);
+      if (!allowDangling) {
+        const names = new Set(graph.entities.map(e => e.name));
+        const missing = new Set<string>();
+        for (const r of relations) {
+          if (!names.has(r.from)) missing.add(r.from);
+          if (!names.has(r.to)) missing.add(r.to);
+        }
+        if (missing.size > 0) {
+          throw new Error(
+            `Cannot create relation(s): endpoint entities do not exist: ${[...missing].sort().join(', ')}. ` +
+            `Create them first, or pass allowDangling:true to override.`,
+          );
+        }
+      }
       // O(R+k) 去重：以關係鍵 Set 取代 filter 內嵌套 .some 的 O(k·R)。
       const existingKeys = new Set(graph.relations.map(relationKey));
       const newRelations = relations.filter(r => !existingKeys.has(relationKey(r)));
@@ -743,6 +822,166 @@ export class KnowledgeGraphManager {
 
     // 因使用共享快取參考，需深拷貝回傳的子圖，避免呼叫端透過回傳值污染快取。
     return structuredClone({ entities: filteredEntities, relations: filteredRelations });
+  }
+
+  // 原地更新實體：可改名與/或改 entityType，保留 observations（順序不變）。
+  // 改名時連帶更新所有 relation 的 from/to 端點；目標名已存在則報錯不覆蓋。
+  async updateEntity(name: string, changes: { newName?: string | undefined; entityType?: string | undefined }, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<Entity> {
+    const newName = changes.newName;
+    const entityType = changes.entityType;
+    const wantsRename = newName !== undefined && newName !== '';
+    const wantsRetype = entityType !== undefined && entityType !== '';
+    if (!wantsRename && !wantsRetype) {
+      throw new Error('updateEntity requires at least one of newName or entityType');
+    }
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
+      const entity = graph.entities.find(e => e.name === name);
+      if (!entity) {
+        throw new Error(`Entity with name ${name} not found`);
+      }
+      // 僅在確實改成不同名稱時才重寫端點；改成自身視為無操作。
+      if (wantsRename && newName !== name) {
+        if (graph.entities.some(e => e.name === newName)) {
+          throw new Error(`Cannot rename to ${newName}: an entity with that name already exists`);
+        }
+        entity.name = newName!;
+        for (const r of graph.relations) {
+          if (r.from === name) r.from = newName!;
+          if (r.to === name) r.to = newName!;
+        }
+      }
+      if (wantsRetype) {
+        entity.entityType = entityType!;
+      }
+      await this.saveGraph(graph, filePath);
+      return entity;
+    });
+  }
+
+  // 原子「刪舊補新」：刪除某實體所有命中（matchPrefix 或 matchSubstring 二擇一）的 observation，
+  // 再追加 newText（同一寫入完成）。0 命中則不追加並回傳 matched:0（防靜默 no-op）。
+  async replaceFact(entityName: string, match: { prefix?: string | undefined; substring?: string | undefined }, newText: string, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ matched: number; replaced: boolean }> {
+    const hasPrefix = match.prefix !== undefined && match.prefix !== '';
+    const hasSubstring = match.substring !== undefined && match.substring !== '';
+    if (hasPrefix === hasSubstring) {
+      throw new Error('replaceFact requires exactly one of matchPrefix or matchSubstring');
+    }
+    const predicate = hasPrefix
+      ? (o: string) => o.startsWith(match.prefix!)
+      : (o: string) => o.includes(match.substring!);
+
+    const filePath = this.resolvePath(context, location, projectRoot);
+    return this.runExclusive(filePath, async () => {
+      const graph = await this.loadGraph(filePath);
+      const entity = graph.entities.find(e => e.name === entityName);
+      if (!entity) {
+        throw new Error(`Entity with name ${entityName} not found`);
+      }
+      const kept = entity.observations.filter(o => !predicate(o));
+      const matched = entity.observations.length - kept.length;
+      // 0 命中：不追加、不寫檔（避免無謂觸碰 mtime），明確回報以防靜默 no-op。
+      if (matched === 0) {
+        return { matched: 0, replaced: false };
+      }
+      // 追加新文字；若已存在於未命中者中則不重複，維持與 add_facts 一致的去重語義。
+      if (!kept.includes(newText)) kept.push(newText);
+      entity.observations = kept;
+      await this.saveGraph(graph, filePath);
+      return { matched, replaced: true };
+    });
+  }
+
+  // 唯讀圖譜審計：孤兒實體、懸空關係、entityType 格式碰撞、同 key 前綴的重複候選 observations、
+  // 以及計數/型別分佈統計。針對單一資料庫（context 或 default）運作，與其他工具的 per-context 設計一致。
+  async doctor(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<DoctorReport> {
+    const graph = await this.loadGraphShared(this.resolvePath(context, location, projectRoot));
+    const names = new Set(graph.entities.map(e => e.name));
+
+    // orphans：不作為任何 relation 端點的 entity。
+    const connected = new Set<string>();
+    for (const r of graph.relations) {
+      connected.add(r.from);
+      connected.add(r.to);
+    }
+    const orphans = graph.entities
+      .filter(e => !connected.has(e.name))
+      .map(e => e.name)
+      .sort((a, b) => a.localeCompare(b));
+
+    // danglingRelations：任一端點不存在於實體集合。
+    const danglingRelations = graph.relations
+      .filter(r => !names.has(r.from) || !names.has(r.to))
+      .map(r => ({ from: r.from, relationType: r.relationType, to: r.to }));
+
+    // typeCollisions：正規化鍵相同但原字串多於一種的分組。
+    const byNorm = new Map<string, Set<string>>();
+    for (const e of graph.entities) {
+      const k = normalizeTypeKey(e.entityType);
+      const set = byNorm.get(k);
+      if (set) set.add(e.entityType);
+      else byNorm.set(k, new Set([e.entityType]));
+    }
+    const typeCollisions = [...byNorm.entries()]
+      .filter(([, set]) => set.size >= 2)
+      .map(([normalized, set]) => ({ normalized, types: [...set].sort((a, b) => a.localeCompare(b)) }))
+      .sort((a, b) => a.normalized.localeCompare(b.normalized));
+
+    // duplicateCandidates：同一 entity 內共用相同 ':' key 前綴的多條 observations。
+    const duplicateCandidates: DoctorReport['duplicateCandidates'] = [];
+    for (const e of graph.entities) {
+      const groups = new Map<string, string[]>();
+      for (const o of e.observations) {
+        const idx = o.indexOf(':');
+        if (idx <= 0) continue; // 無 key 前綴（無 ':' 或以 ':' 開頭）則略過。
+        const prefix = o.slice(0, idx).trim();
+        if (prefix === '') continue;
+        const arr = groups.get(prefix);
+        if (arr) arr.push(o);
+        else groups.set(prefix, [o]);
+      }
+      for (const [keyPrefix, obs] of groups) {
+        if (obs.length >= 2) {
+          duplicateCandidates.push({ entityName: e.name, keyPrefix, count: obs.length, observations: obs });
+        }
+      }
+    }
+    duplicateCandidates.sort((a, b) => a.entityName.localeCompare(b.entityName) || a.keyPrefix.localeCompare(b.keyPrefix));
+
+    // stats：計數與型別分佈。
+    const entityTypeDistribution: Record<string, number> = {};
+    let observationCount = 0;
+    for (const e of graph.entities) {
+      entityTypeDistribution[e.entityType] = (entityTypeDistribution[e.entityType] ?? 0) + 1;
+      observationCount += e.observations.length;
+    }
+
+    return {
+      orphans,
+      danglingRelations,
+      typeCollisions,
+      duplicateCandidates,
+      stats: {
+        database: context || 'default',
+        entityCount: graph.entities.length,
+        relationCount: graph.relations.length,
+        observationCount,
+        entityTypeDistribution,
+      },
+    };
+  }
+
+  // 唯讀：回傳各 entityType 與其實體計數，數量多者在前（同數以名稱排序）。
+  async listEntityTypes(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ entityType: string; count: number }[]> {
+    const graph = await this.loadGraphShared(this.resolvePath(context, location, projectRoot));
+    const counts = new Map<string, number>();
+    for (const e of graph.entities) {
+      counts.set(e.entityType, (counts.get(e.entityType) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([entityType, count]) => ({ entityType, count }))
+      .sort((a, b) => b.count - a.count || a.entityType.localeCompare(b.entityType));
   }
 
   async listDatabases(projectRoot?: string): Promise<{ project_databases: string[], global_databases: string[], current_location: string }> {

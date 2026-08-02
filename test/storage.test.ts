@@ -25,7 +25,7 @@ test('createEntities writes <projectRoot>/.aim/memory.jsonl with the _aim marker
     undefined,
     root,
   );
-  assert.equal(created.length, 1);
+  assert.equal(created.entities.length, 1);
 
   const file = path.join(root, '.aim', 'memory.jsonl');
   assert.ok(existsSync(file), 'expected memory.jsonl to be created');
@@ -195,7 +195,7 @@ test('createEntities ignores names that already exist (dedup, existing untouched
     undefined,
     root,
   );
-  assert.deepEqual(created.map(e => e.name), ['B'], 'only the genuinely new entity is returned');
+  assert.deepEqual(created.entities.map(e => e.name), ['B'], 'only the genuinely new entity is returned');
   const g = await mgr.readGraph(undefined, undefined, root);
   assert.equal(g.entities.length, 2);
   assert.deepEqual(g.entities.find(e => e.name === 'A')!.observations, ['x'], 'existing entity left untouched');
