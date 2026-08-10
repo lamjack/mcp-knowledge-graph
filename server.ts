@@ -8,7 +8,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { pkg } from './config.js';
+import { pkg, maxOutputChars } from './config.js';
 import {
   knowledgeGraphManager,
   formatGraphPretty,
@@ -38,6 +38,57 @@ export function projectObservations(graph: KnowledgeGraph, includeObservations: 
     };
   }
   return graph;
+}
+
+// 分頁結果的中繼資訊。entity 是觀察值的載體（大圖體積的主要來源），故分頁作用於 entity 清單；
+// relations 是廉價的骨架，每頁完整回傳，便於呼叫端在任一頁都能看到關係脈絡。
+export interface PageInfo {
+  offset: number;
+  count: number;
+  total: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}
+
+// 將 client 傳入的數值正規化為非負整數；非有限數（未提供/NaN/Infinity）回傳 undefined。
+// 與 searchNodes 的 limit/depth 正規化採相同語義，確保跨工具一致。
+function normNonNeg(raw: unknown): number | undefined {
+  return (typeof raw === 'number' && Number.isFinite(raw)) ? Math.max(0, Math.floor(raw)) : undefined;
+}
+
+// read_all 的 entity 分頁：以 offset/limit 切片 entities，relations 原樣保留。
+// 僅在確有分頁意圖（提供 limit，或 offset > 0）時啟用；否則回傳原圖且 pageInfo 為 null，
+// 維持不帶分頁參數時的既有行為（含 JSON 輸出逐位元組相容）。
+export function paginateGraph(graph: KnowledgeGraph, rawOffset: unknown, rawLimit: unknown): { graph: KnowledgeGraph; pageInfo: PageInfo | null } {
+  const offset = normNonNeg(rawOffset) ?? 0;
+  const limit = normNonNeg(rawLimit); // undefined = 不限筆數
+  const active = limit !== undefined || offset > 0;
+  if (!active) return { graph, pageInfo: null };
+
+  const total = graph.entities.length;
+  const end = limit === undefined ? total : Math.min(total, offset + limit);
+  const entities = graph.entities.slice(offset, end);
+  const hasMore = end < total;
+  return {
+    graph: { entities, relations: graph.relations },
+    pageInfo: { offset, count: entities.length, total, hasMore, nextOffset: hasMore ? end : null },
+  };
+}
+
+// 分頁抬頭：讓模型知道目前讀到哪段、是否還有更多、以及下一頁該用的 offset。
+function pageHeader(p: PageInfo): string {
+  const tail = p.hasMore ? ` — more available: call read_all again with offset=${p.nextOffset}` : ' — end of list';
+  return `[page] entities ${p.offset}-${p.offset + p.count} of ${p.total}${tail}`;
+}
+
+// 縱深防禦：讀取型工具的輸出硬性字元上限。超過即截斷並附指引，讓過大的回傳永遠不會
+// 撐爆 MCP 客戶端（避免 "Encountered unexpected error during execution"）。截斷可能破壞
+// JSON 結構，指引中明示如何縮小結果。
+export function capText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const notice = `\n\n[truncated: output exceeded ${max} chars (was ${text.length}). Narrow the result: use includeObservations:false, aim_memory_search, or read_all with offset/limit.]`;
+  const budget = Math.max(0, max - notice.length);
+  return text.slice(0, budget) + notice;
 }
 
 // 伺服器實例與公開給 AI 模型的工具
@@ -98,7 +149,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "aim_memory_read_all": {
       const graph = await knowledgeGraphManager.readGraph(args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
       const projected = projectObservations(graph, args.includeObservations);
-      return { content: [{ type: "text", text: formatGraph(projected, args.format, args.context as string) }] };
+      // entity 分頁：切片後才格式化，讓大圖可分批讀取；有分頁時前置抬頭告知進度與下一頁 offset。
+      const { graph: paged, pageInfo } = paginateGraph(projected, args.offset, args.limit);
+      let text = formatGraph(paged, args.format, args.context as string);
+      if (pageInfo) text = `${pageHeader(pageInfo)}\n${text}`;
+      // 縱深防禦上限：即使未分頁或分頁後仍過大，也絕不回傳撐爆客戶端的巨量文字。
+      return { content: [{ type: "text", text: capText(text, maxOutputChars) }] };
     }
     case "aim_memory_search": {
       const graph = await knowledgeGraphManager.searchNodes(
@@ -108,12 +164,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         args.projectRoot as string,
         { limit: args.limit as number | undefined, depth: args.depth as number | undefined },
       );
-      return { content: [{ type: "text", text: formatGraph(graph, args.format, args.context as string) }] };
+      return { content: [{ type: "text", text: capText(formatGraph(graph, args.format, args.context as string), maxOutputChars) }] };
     }
     case "aim_memory_get": {
       const graph = await knowledgeGraphManager.openNodes(args.names as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
       const projected = projectObservations(graph, args.includeObservations);
-      return { content: [{ type: "text", text: formatGraph(projected, args.format, args.context as string) }] };
+      return { content: [{ type: "text", text: capText(formatGraph(projected, args.format, args.context as string), maxOutputChars) }] };
     }
     case "aim_memory_list_stores":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(args.projectRoot as string), null, 2) }] };

@@ -289,12 +289,19 @@ EXAMPLES:
 FORMAT OPTIONS:
 - "json" (default): Structured JSON for programmatic use
 - "pretty": Human-readable text format
+- "concise": Token-efficient one-line-per-entity form
 
 DATABASE: Reads from the specified 'context' database, or master database if not specified.
 
+LARGE GRAPHS: The full graph can be hundreds of KB and exceed what the MCP client can ingest (causing a client-side "unexpected error"). To stay small:
+- Prefer includeObservations:false (and/or format:"concise") to get just the name/type + relation skeleton.
+- Use offset/limit to page through entities (their observations) in batches. Relations are returned in full on every page. When paged, the output is prefixed with a "[page]" header telling you the range and the next offset.
+- As a last-resort safety net, oversized output is truncated with a notice (configurable via --max-output-chars / AIM_MAX_OUTPUT_CHARS).
+
 EXAMPLES:
 - aim_memory_read_all({}) - JSON format
-- aim_memory_read_all({format: "pretty"}) - Human-readable
+- aim_memory_read_all({format: "concise", includeObservations: false}) - lightweight skeleton (recommended for large graphs)
+- aim_memory_read_all({format: "concise", offset: 0, limit: 20}) - first 20 entities with observations, then call again with offset: 20
 - aim_memory_read_all({context: "work", format: "pretty"}) - Work database, pretty`,
     inputSchema: {
       type: "object",
@@ -307,6 +314,14 @@ EXAMPLES:
         location: locationProp,
         format: formatProp,
         includeObservations: includeObservationsProp,
+        offset: {
+          type: "number",
+          description: "Optional 0-based index of the first entity to return (default 0). Use with 'limit' to page through a large graph. Relations are returned in full on every page."
+        },
+        limit: {
+          type: "number",
+          description: "Optional maximum number of entities to return in this page. Omit to return all entities (subject to the output-size cap). When provided, the response is prefixed with a '[page]' header indicating the range and the next offset to request."
+        },
       },
     },
   },

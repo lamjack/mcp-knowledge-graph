@@ -51,3 +51,18 @@ export const FILE_MARKER = {
 // 透過 `--workspace-only` 旗標或 AIM_WORKSPACE_ONLY=true 環境變數啟用。
 export const workspaceOnly: boolean =
   argv['workspace-only'] === true || process.env.AIM_WORKSPACE_ONLY === 'true';
+
+// 讀取型工具（read_all / search / get）單次回傳文字的硬性字元上限（縱深防禦）。
+// 大圖的整圖序列化可達數百 KB，超過 MCP 客戶端（如 Windsurf/Cascade）可吸收的上限時，
+// 客戶端會以 "Encountered unexpected error during execution" 失敗。此上限確保回傳先被
+// 優雅截斷並附指引，永不撐爆客戶端。可透過 `--max-output-chars` 或 AIM_MAX_OUTPUT_CHARS 覆寫。
+// 預設值刻意保守（遠低於常見客戶端上限），因各客戶端實際上限未公開；建議搭配分頁與
+// includeObservations:false 作為主要手段，此上限僅為最後防線。
+const DEFAULT_MAX_OUTPUT_CHARS = 50_000;
+function resolveMaxOutputChars(): number {
+  const raw = argv['max-output-chars'] ?? process.env.AIM_MAX_OUTPUT_CHARS;
+  const n = typeof raw === 'number' ? raw : (typeof raw === 'string' ? Number(raw) : NaN);
+  if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  return DEFAULT_MAX_OUTPUT_CHARS;
+}
+export const maxOutputChars: number = resolveMaxOutputChars();
