@@ -1,10 +1,11 @@
 // Tests for the large-graph safety features that prevent the MCP client from
 // erroring on oversized read results ("Encountered unexpected error during
 // execution"):
-//   1. paginateGraph  - slice entities via offset/limit, relations kept whole
-//   2. capText        - hard output-size cap (defense-in-depth net)
-//   3. read_all over stdio honours offset/limit and emits a pagination header
-//   4. --max-output-chars truncates oversized read output with guidance
+//   1. paginateGraph     - slice entities via offset/limit, relations kept whole
+//   2. capText           - hard output-size cap (defense-in-depth net)
+//   3. autoPaginateText  - unpaginated overflow degrades to a well-formed first page
+//   4. read_all over stdio honours offset/limit and emits a pagination header
+//   5. --max-output-chars truncates oversized read output with guidance
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +15,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { mkdtempSync } from 'node:fs';
 
-import { paginateGraph, capText } from '../server.js';
+import { paginateGraph, capText, autoPaginateText } from '../server.js';
 import type { KnowledgeGraph } from '../storage.js';
 
 const SERVER = fileURLToPath(new URL('../index.js', import.meta.url));
@@ -91,6 +92,57 @@ test('capText: truncates oversized text, stays within the cap, and appends guida
   assert.ok(out.length <= 200, `capped length ${out.length} must be <= 200`);
   assert.match(out, /truncated/);
   assert.match(out, /offset\/limit/);
+});
+
+// --- autoPaginateText ------------------------------------------------------
+
+test('autoPaginateText: returns null when not even one entity fits the budget', () => {
+  const g = makeGraph(3);
+  assert.equal(autoPaginateText(g, 'concise', undefined, 10), null);
+});
+
+test('autoPaginateText: fits the maximal whole-entity prefix under the budget', () => {
+  const g = makeGraph(6);
+  // Hand-derived: each entity adds exactly 15 chars in concise format (14-char line
+  // + newline), so a budget fitting the 2-entity page exactly rejects 3 entities,
+  // and one char less drops to a single entity.
+  const twoPage = [
+    '[page] entities 0-2 of 6 — more available: call read_all again with offset=2',
+    '=== default database (concise) ===',
+    'ENTITIES (2):',
+    '- E0 (t): obs0',
+    '- E1 (t): obs1',
+    'RELATIONS (1):',
+    '- E0 -[r]-> E1',
+  ].join('\n');
+  assert.equal(autoPaginateText(g, 'concise', undefined, twoPage.length), twoPage);
+
+  const onePage = [
+    '[page] entities 0-1 of 6 — more available: call read_all again with offset=1',
+    '=== default database (concise) ===',
+    'ENTITIES (1):',
+    '- E0 (t): obs0',
+    'RELATIONS (1):',
+    '- E0 -[r]-> E1',
+  ].join('\n');
+  assert.equal(autoPaginateText(g, 'concise', undefined, twoPage.length - 1), onePage);
+});
+
+test('autoPaginateText: json payload stays parseable and retains the full relation skeleton', () => {
+  const g = makeGraph(6);
+  // Budget one char below the full serialization forces auto-pagination; the
+  // 5-entity page (header + JSON minus one entity block) must still fit.
+  const full = JSON.stringify(g, null, 2);
+  const out = autoPaginateText(g, undefined, undefined, full.length - 1);
+  assert.ok(out, 'expected an auto-paginated page, not null');
+  const nl = out!.indexOf('\n');
+  const header = out!.slice(0, nl);
+  assert.match(
+    header,
+    /^\[page\] entities 0-5 of 6 — more available: call read_all again with offset=5$/,
+  );
+  const parsed = JSON.parse(out!.slice(nl + 1));
+  assert.deepEqual(parsed, { entities: g.entities.slice(0, 5), relations: g.relations });
 });
 
 // --- stdio integration -----------------------------------------------------
@@ -170,21 +222,21 @@ const call = (id: number, name: string, args: object) => ({
   params: { name, arguments: args },
 });
 
-const storeMany = (id: number, root: string, n: number) =>
+const storeMany = (id: number, root: string, n: number, obsLen = 0) =>
   call(id, 'aim_memory_store', {
     projectRoot: root,
     entities: Array.from({ length: n }, (_, i) => ({
       name: `E${i}`,
       entityType: 't',
-      observations: [`obs${i}`],
+      observations: [obsLen > 0 ? 'x'.repeat(obsLen) : `obs${i}`],
     })),
   });
 
 // Persist in one server session, then read in a second. Reads are file-backed and
 // do not go through the per-file write serialization, so storing and reading within
 // a single stdio session can race; two sessions against the same root are race-free.
-async function seed(root: string, n: number, args: string[] = []): Promise<void> {
-  const out = await driveServer(args, [INIT, INITIALIZED, storeMany(2, root, n)], 2);
+async function seed(root: string, n: number, args: string[] = [], obsLen = 0): Promise<void> {
+  const out = await driveServer(args, [INIT, INITIALIZED, storeMany(2, root, n, obsLen)], 2);
   const resp = out.find(m => m.id === 2);
   assert.ok(resp?.result, 'precondition: store must succeed');
 }
@@ -218,6 +270,48 @@ test('read_all over stdio: --max-output-chars truncates oversized output with gu
   const out = await driveServer(
     ['--max-output-chars=80'],
     [INIT, INITIALIZED, call(3, 'aim_memory_read_all', { projectRoot: root, format: 'concise' })],
+    3,
+  );
+  const resp = out.find(m => m.id === 3);
+  assert.ok(resp?.result, 'expected a read_all result');
+  const text: string = resp.result.content[0].text;
+  assert.match(text, /truncated/);
+});
+
+test('read_all over stdio: oversized unpaginated output auto-paginates instead of truncating', async () => {
+  const root = tmpRoot();
+  // 60-char observations: concise page size is 155 + 71k chars for k entities,
+  // so a 400-char cap fits exactly 3 entities per page.
+  await seed(root, 6, [], 60);
+  const out = await driveServer(
+    ['--max-output-chars=400'],
+    [INIT, INITIALIZED, call(3, 'aim_memory_read_all', { projectRoot: root, format: 'concise' })],
+    3,
+  );
+  const resp = out.find(m => m.id === 3);
+  assert.ok(resp?.result, 'expected a read_all result');
+  const text: string = resp.result.content[0].text;
+  assert.match(
+    text,
+    /^\[page\] entities 0-3 of 6 — more available: call read_all again with offset=3\n/,
+  );
+  assert.doesNotMatch(text, /truncated/);
+  assert.ok(text.length <= 400, `auto-paged output ${text.length} must be <= 400`);
+  assert.match(text, /- E0 \(t\)/);
+  assert.match(text, /- E2 \(t\)/);
+  assert.doesNotMatch(text, /- E3 \(t\)/);
+});
+
+test('read_all over stdio: an explicitly requested page that still exceeds the cap is hard-capped', async () => {
+  const root = tmpRoot();
+  await seed(root, 6, [], 60);
+  const out = await driveServer(
+    ['--max-output-chars=400'],
+    [
+      INIT,
+      INITIALIZED,
+      call(3, 'aim_memory_read_all', { projectRoot: root, format: 'concise', offset: 0, limit: 6 }),
+    ],
     3,
   );
   const resp = out.find(m => m.id === 3);

@@ -190,6 +190,15 @@ my-project/
 - `limit`（可選，`aim_memory_search`）— 只回傳相關性最高的前 N 個命中實體（seeds）。相關性排序：name 完全命中 > name 子字串 > type > observation。由 `depth` 帶入的鄰居不計入此上限
 - `depth`（可選，`aim_memory_search`，預設 `1`）— 由每個命中實體向外擴展的關係跳數，帶入鄰居提供脈絡。設為 `0` 只回傳命中實體與其之間的關係
 - `includeObservations`（可選，`aim_memory_read_all` / `aim_memory_get`，預設 `true`）— 設為 `false` 時只回傳每個 entity 的 `name` + `entityType`（省略 observations）與完整關係骨架，供審計/索引大圖時避免數百 KB 輸出被截斷
+- `offset` / `limit`（可選，`aim_memory_read_all`）— 以 entity 為單位分批讀取大圖；relations 骨架每頁完整回傳。帶分頁時輸出前置 `[page]` 抬頭，標示本頁範圍與下一頁的 `offset`
+
+### 輸出大小上限與自動分頁
+
+讀取型工具（`read_all` / `search` / `get`）的單次回傳有硬性字元上限（預設 50,000，可用 `--max-output-chars` 或 `AIM_MAX_OUTPUT_CHARS` 覆寫），避免超大輸出撐爆 MCP 客戶端（"Encountered unexpected error during execution"）：
+
+- **`read_all` 未帶 `offset`/`limit` 且全圖超過上限**：自動降級為「放得進預算的最大第一頁」（entity 邊界切齊、relations 骨架完整、格式保持有效），前置 `[page]` 抬頭附下一頁 `offset`——逐頁續讀即可走完全圖，不會收到截斷的破損 JSON。
+- **明確分頁（帶 `offset`/`limit`）後仍超過上限**：退回硬性截斷並附指引（請縮小 `limit`）；`search` / `get` 超限同樣走硬性截斷。
+- 大圖建議搭配 `includeObservations: false` 或 `format: "concise"` 先讀骨架，再對目標實體取完整內容。
 - `allowDangling`（可選，`aim_memory_link`，預設 `false`）— 逃生門。預設會拒絕指向不存在端點的連結；設 `true` 允許建立端點尚不存在的關係（舊寬鬆行為）
 
 ### 搜尋行為（相關性排序 + ego-graph 擴展）

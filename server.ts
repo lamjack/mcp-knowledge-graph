@@ -81,6 +81,27 @@ function pageHeader(p: PageInfo): string {
   return `[page] entities ${p.offset}-${p.offset + p.count} of ${p.total}${tail}`;
 }
 
+// read_all 未帶分頁參數、格式化輸出仍超過 max 時的自動降級：以 entity 邊界切出能放進
+// 預算的最大前綴作為「第一頁」（relations 骨架完整保留），前置 [page] 抬頭告知
+// nextOffset，讓模型以 offset 逐頁續讀。輸出維持所選格式的完整性（json 仍可解析），
+// 取代 capText 硬切造成的破損 JSON 與每輪召回必現的截斷提示。連第一個 entity 都放不
+// 進預算時回傳 null，由呼叫端退回 capText 硬切作最後防線。
+export function autoPaginateText(graph: KnowledgeGraph, format: unknown, context: string | undefined, max: number): string | null {
+  const total = graph.entities.length;
+  const render = (k: number): string => {
+    const paged = { entities: graph.entities.slice(0, k), relations: graph.relations };
+    return `${pageHeader({ offset: 0, count: k, total, hasMore: true, nextOffset: k })}\n${formatGraph(paged, format, context)}`;
+  };
+  // 二分搜尋最大 k ∈ [1, total)：render(k) 長度隨 k 單調遞增；k=total 必超過 max，
+  // 否則呼叫端不會進入此路徑。
+  let lo = 1, hi = total - 1, best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (render(mid).length <= max) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best > 0 ? render(best) : null;
+}
+
 // 縱深防禦：讀取型工具的輸出硬性字元上限。超過即截斷並附指引，讓過大的回傳永遠不會
 // 撐爆 MCP 客戶端（避免 "Encountered unexpected error during execution"）。截斷可能破壞
 // JSON 結構，指引中明示如何縮小結果。
@@ -152,9 +173,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // entity 分頁：切片後才格式化，讓大圖可分批讀取；有分頁時前置抬頭告知進度與下一頁 offset。
       const { graph: paged, pageInfo } = paginateGraph(projected, args.offset, args.limit);
       let text = formatGraph(paged, args.format, args.context as string);
-      if (pageInfo) text = `${pageHeader(pageInfo)}\n${text}`;
-      // 縱深防禦上限：即使未分頁或分頁後仍過大，也絕不回傳撐爆客戶端的巨量文字。
-      return { content: [{ type: "text", text: capText(text, maxOutputChars) }] };
+      if (pageInfo) {
+        // 明確分頁後仍超過上限：批次大小由呼叫端掌控，退回硬性截斷作最後防線。
+        text = capText(`${pageHeader(pageInfo)}\n${text}`, maxOutputChars);
+      } else if (text.length > maxOutputChars) {
+        // 未分頁的全圖讀取超過上限：自動降級為第一頁（格式完整、附續讀 offset），
+        // 連一個 entity 都放不下才退回硬性截斷。絕不回傳撐爆客戶端的巨量文字。
+        text = autoPaginateText(projected, args.format, args.context as string, maxOutputChars)
+          ?? capText(text, maxOutputChars);
+      }
+      return { content: [{ type: "text", text }] };
     }
     case "aim_memory_search": {
       const graph = await knowledgeGraphManager.searchNodes(

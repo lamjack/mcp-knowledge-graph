@@ -296,7 +296,8 @@ DATABASE: Reads from the specified 'context' database, or master database if not
 LARGE GRAPHS: The full graph can be hundreds of KB and exceed what the MCP client can ingest (causing a client-side "unexpected error"). To stay small:
 - Prefer includeObservations:false (and/or format:"concise") to get just the name/type + relation skeleton.
 - Use offset/limit to page through entities (their observations) in batches. Relations are returned in full on every page. When paged, the output is prefixed with a "[page]" header telling you the range and the next offset.
-- As a last-resort safety net, oversized output is truncated with a notice (configurable via --max-output-chars / AIM_MAX_OUTPUT_CHARS).
+- If you call read_all WITHOUT offset/limit and the full output would exceed the cap, the response automatically degrades to the largest first page that fits (same "[page]" header with the next offset) — keep calling with that offset to walk the whole graph. The payload stays well-formed (valid JSON in json format).
+- Hard truncation with a notice remains only as a last-resort net for an explicitly requested page that still exceeds the cap (reduce limit), configurable via --max-output-chars / AIM_MAX_OUTPUT_CHARS.
 
 EXAMPLES:
 - aim_memory_read_all({}) - JSON format
