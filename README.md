@@ -201,6 +201,10 @@ my-project/
 - 大圖建議搭配 `includeObservations: false` 或 `format: "concise"` 先讀骨架，再對目標實體取完整內容。
 - `allowDangling`（可選，`aim_memory_link`，預設 `false`）— 逃生門。預設會拒絕指向不存在端點的連結；設 `true` 允許建立端點尚不存在的關係（舊寬鬆行為）
 
+### 錯誤通道
+
+所有工具層錯誤（缺必填參數、實體不存在、workspace-only 拒絕、無效 context 等）一律以 **`isError: true` 的正常 tools/call 結果**回傳，錯誤訊息放在 `content[].text`——而不是 JSON-RPC 協議級錯誤。這符合 MCP 對工具錯誤的建議通道，讓客戶端把訊息交給模型修正呼叫；部分客戶端會把協議級錯誤誤判為連線故障而殺掉並重啟健康的 server 行程（重連風暴），對模型呈現為「Failed to connect」。
+
 ### 搜尋行為（相關性排序 + ego-graph 擴展）
 
 `aim_memory_search` 會對每個實體評分後依相關性排序，並預設擴展 1 跳鄰居，確保命中實體的關係與上下文不被丟棄（即使鄰居本身未命中關鍵字）。搭配 `limit` 可只取 top-k、搭配 `format:"concise"` 可大幅降低回填 context 的 token 量。

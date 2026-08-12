@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { pkg, maxOutputChars } from './config.js';
@@ -139,6 +140,20 @@ function assertRequiredArgs(toolName: string, args: Record<string, unknown>): vo
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  try {
+    return await dispatchTool(request);
+  } catch (error) {
+    // 工具層錯誤一律回傳 isError:true 的正常結果，而非拋出讓 SDK 產生協議級
+    // JSON-RPC 錯誤（-32603）。有客戶端會把任何協議級錯誤誤判為連線故障，
+    // 殺掉健康的 server 行程重連重試（參數不變照樣失敗），對模型呈現為
+    // 「Failed to connect」與整段斷連窗口。isError 結果讓錯誤訊息回到模型
+    // 手中，模型可據此修正呼叫。錯誤不中斷 server，也不吞掉——訊息完整回傳。
+    const message = error instanceof Error ? error.message : String(error);
+    return { content: [{ type: "text", text: message }], isError: true };
+  }
+});
+
+async function dispatchTool(request: CallToolRequest) {
   const { name, arguments: args } = request.params;
 
   if (!args) {
@@ -233,7 +248,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
-});
+}
 
 export async function main() {
   const transport = new StdioServerTransport();

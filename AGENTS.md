@@ -9,7 +9,7 @@ MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供
 - `config.ts` — CLI 參數（minimist）、基底記憶路徑、`_aim` 檔案標記、`maxOutputChars`
 - `storage.ts` — 路徑安全、JSONL 解析、KnowledgeGraphManager（CRUD + 搜尋 + 健檢）、mtime+size 讀取快取（回傳深拷貝）
 - `tools.ts` — MCP 工具 schema 與給模型看的工具描述
-- `server.ts` — stdio 伺服器接線、工具 handler、輸出格式化 / 分頁 / 截斷
+- `server.ts` — stdio 伺服器接線、工具 handler（`dispatchTool`）、輸出格式化 / 分頁 / 截斷、工具錯誤通道（isError）
 - `index.ts` — bin 進入點
 
 ## Setup & Build
@@ -36,3 +36,4 @@ MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供
 - **`read_all` 未分頁超限 → 自動分頁**：`autoPaginateText`（server.ts）以 entity 邊界切出放得進預算的最大第一頁，`[page]` 抬頭附 `nextOffset`，payload 保持格式有效（json 可解析）；連一個 entity 都放不下才退回 `capText` 硬切
 - **明確分頁（offset/limit）超限、`search` / `get` 超限 → `capText` 硬切**並附指引（截斷會破壞 JSON，屬最後防線）
 - 截斷 / 分頁只切 entity 邊界；relations 骨架每頁完整保留
+- **錯誤通道**：所有工具層錯誤（缺參數、實體不存在、workspace-only 拒絕等）一律回傳 `isError: true` 的正常 tools/call 結果（訊息在 `content[].text`），不得拋成協議級 JSON-RPC 錯誤——有客戶端會把協議級錯誤誤判為連線故障而殺掉重啟健康的 server 行程（重連風暴，對模型呈現為 "Failed to connect to MCP server"）

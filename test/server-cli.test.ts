@@ -79,8 +79,9 @@ test('M2: --workspace-only=true (explicit value form) enables strict mode', asyn
   const out = await driveServer(['--workspace-only=true'], [INIT, INITIALIZED, callStore(3, { entities: [] })], 3);
   const resp = out.find(m => m.id === 3);
   assert.ok(resp, 'expected a response for id 3');
-  assert.ok(resp.error, 'strict mode must reject a store without projectRoot');
-  assert.match(resp.error.message, /projectRoot is required/);
+  // 工具層錯誤以 isError 結果回傳（非協議級錯誤），見 tool-errors.test.ts 的契約說明。
+  assert.ok(resp.result?.isError, 'strict mode must reject a store without projectRoot');
+  assert.match(resp.result.content[0].text, /projectRoot is required/);
 });
 
 test('M1: workspace-only tools/list drops location and requires projectRoot with a NOTE', async () => {
@@ -98,8 +99,8 @@ test('M1: workspace-only tools/list drops location and requires projectRoot with
 test('L3: handler rejects a call missing a required data argument', async () => {
   const out = await driveServer([], [INIT, INITIALIZED, callStore(4, {})], 4);
   const resp = out.find(m => m.id === 4);
-  assert.ok(resp?.error, 'expected an error for a store without entities');
-  assert.match(resp.error.message, /Missing required argument\(s\) for aim_memory_store: entities/);
+  assert.ok(resp?.result?.isError, 'expected an isError result for a store without entities');
+  assert.match(resp.result.content[0].text, /Missing required argument\(s\) for aim_memory_store: entities/);
 });
 
 test('default mode keeps location and omits the workspace-only note (regression)', async () => {
