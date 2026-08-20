@@ -9,89 +9,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
-import os from 'node:os';
-import { mkdtempSync } from 'node:fs';
 
-const SERVER = fileURLToPath(new URL('../index.js', import.meta.url));
-
-const INIT = {
-  jsonrpc: '2.0',
-  id: 1,
-  method: 'initialize',
-  params: {
-    protocolVersion: '2024-11-05',
-    capabilities: {},
-    clientInfo: { name: 'test', version: '0' },
-  },
-};
-const INITIALIZED = { jsonrpc: '2.0', method: 'notifications/initialized' };
-
-const call = (id: number, name: string, args: object) => ({
-  jsonrpc: '2.0',
-  id,
-  method: 'tools/call',
-  params: { name, arguments: args },
-});
+import { INIT, INITIALIZED, call, driveServer, tmpRoot as makeTmpRoot } from './helpers.js';
 
 function tmpRoot(): string {
-  return mkdtempSync(path.join(os.tmpdir(), 'kg-err-'));
-}
-
-// 與 pagination.test.ts 相同的驅動模式：逐行解析 stdout 的 JSON-RPC 訊息，
-// 收到 waitForId 的回應（無論 result 或 error）即結束。
-function driveServer(
-  args: string[],
-  messages: object[],
-  waitForId: number,
-  timeoutMs = 5000,
-): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('node', [SERVER, ...args], { stdio: ['pipe', 'pipe', 'ignore'] });
-    const out: any[] = [];
-    let buf = '';
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      try {
-        child.stdin.end();
-      } catch {
-        /* noop */
-      }
-      child.kill();
-      resolve(out);
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    child.on('error', err => {
-      if (!done) {
-        done = true;
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-    child.stdout.setEncoding('utf-8');
-    child.stdout.on('data', (chunk: string) => {
-      buf += chunk;
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        try {
-          const obj = JSON.parse(line);
-          out.push(obj);
-          if (obj.id === waitForId) finish();
-        } catch {
-          /* ignore */
-        }
-      }
-    });
-    for (const m of messages) child.stdin.write(JSON.stringify(m) + '\n');
-  });
+  return makeTmpRoot('kg-err-');
 }
 
 // 斷言某 id 的回應是「isError 結構化結果」而非協議級錯誤，且訊息可指導修正。
