@@ -46,6 +46,14 @@ export const FILE_MARKER = {
   source: "mcp-knowledge-graph"
 };
 
+// 記憶檔案系統佈局的單一真相：專案本地目錄名與 JSONL 資料庫檔名 scheme。
+// 集中於此，讓 storage 的檔名編碼（dbFileName）與解碼（dbNameFromFile）共用同一組常量，
+// 避免 '.aim'、'memory.jsonl'、'memory-' 前綴、'.jsonl' 副檔名散落各處（改一處即全改）。
+export const AIM_DIR_NAME = '.aim';
+export const DB_FILE_EXT = '.jsonl';
+export const DB_FILE_PREFIX = 'memory-';
+export const MASTER_DB_FILE = `memory${DB_FILE_EXT}`;
+
 // Workspace-only 嚴格模式：啟用後，每次工具呼叫都必須提供明確的 projectRoot，
 // 全域儲存被停用，讀取／寫入／列表一律限縮在 <projectRoot>/.aim/ 之內。
 // 透過 `--workspace-only` 旗標或 AIM_WORKSPACE_ONLY=true 環境變數啟用。

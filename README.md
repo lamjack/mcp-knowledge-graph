@@ -178,7 +178,7 @@ my-project/
 
 - `aim_memory_update_entity` — **原地**更新實體：改名與/或改 `entityType`，保留 observations（順序不變）。改名會連帶重寫所有 relation 的 `from`/`to` 端點；改名撞到既有名稱則報錯不覆蓋。避免「forget → store → 重新 link」的轉錄風險。參數：`name`（必填）、`newName?`、`entityType?`（後兩者至少給一個）
 - `aim_memory_replace_fact` — 原子「刪舊補新」：刪除某實體所有命中（`matchPrefix` 或 `matchSubstring` 二擇一）的 observation，並在**同一次寫入**追加 `newText`。回傳 `{matched, replaced}`；0 命中時不追加並回傳 `{matched:0, replaced:false}`（不靜默 no-op）。適合取代 key 型 observation（如「開發計畫編號: ...」）。參數：`entityName`、`newText`（必填）、`matchPrefix?`/`matchSubstring?`（恰一）
-- `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 `:` key 前綴的多條 observation）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
+- `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 `:` key 前綴的多條 observation）、`oversizedEntities`（**超大實體警告**：observation 條數 ≥ 50 或字元總量 ≥ 10,000 的實體，依 `totalChars` 遞減排序，附 `exceeds` 原因——超大 hub 被 search/get 命中一次就回傳大量字元稀釋 context，提示拆分或 prune；僅警告不阻斷）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
 - `aim_memory_list_entity_types` — 唯讀，回傳各 `entityType` 與其實體計數（數量多者在前），供型別詞彙治理
 - `aim_memory_count_observations` — 唯讀 observation 計數（**不回本文**）：對指定 entities 回傳 `{entityName, entityExists, totalObservations, matched, groups?}`；`observationPrefix` 必填，加 `groupByDelimiter`（如 `｜`）可把命中條目按「開頭到首個分隔符」分組回傳 `[{key, count}]`。回答「entity 內某前綴有幾個分組、各自 key 是什麼」不需全量拉取，是 SessionLog prune 的決策與刪後核實工具
 

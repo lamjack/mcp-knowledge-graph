@@ -341,6 +341,7 @@ test('doctor returns all-empty findings for a clean graph', async () => {
   assert.deepEqual(report.danglingRelations, []);
   assert.deepEqual(report.typeCollisions, []);
   assert.deepEqual(report.duplicateCandidates, []);
+  assert.deepEqual(report.oversizedEntities, []);
   assert.equal(report.stats.entityCount, 2);
   assert.equal(report.stats.relationCount, 1);
   assert.equal(report.stats.observationCount, 1);
@@ -434,6 +435,88 @@ test('doctor detects duplicate-candidate observations sharing a key prefix', asy
   assert.equal(report.duplicateCandidates[0]!.entityName, 'Plan');
   assert.equal(report.duplicateCandidates[0]!.keyPrefix, '開發計畫編號');
   assert.equal(report.duplicateCandidates[0]!.count, 2);
+});
+
+test('doctor flags entities at or above the observation-count threshold (50)', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      // 每條 'obs-NN' 長 6 字元：50 條共 300 字元，確保只觸發條數閾值、不觸發字元閾值。
+      {
+        name: 'Hub',
+        entityType: 't',
+        observations: Array.from({ length: 50 }, (_, i) => `obs-${String(i).padStart(2, '0')}`),
+      },
+      {
+        name: 'Near',
+        entityType: 't',
+        observations: Array.from({ length: 49 }, (_, i) => `obs-${String(i).padStart(2, '0')}`),
+      },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  assert.equal(report.oversizedEntities.length, 1, '49 observations stays below the threshold');
+  assert.equal(report.oversizedEntities[0]!.entityName, 'Hub');
+  assert.equal(report.oversizedEntities[0]!.observationCount, 50);
+  assert.equal(report.oversizedEntities[0]!.totalChars, 300);
+  assert.deepEqual(report.oversizedEntities[0]!.exceeds, ['observationCount']);
+});
+
+test('doctor flags entities at or above the total-chars threshold (10000)', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      { name: 'Fat', entityType: 't', observations: ['x'.repeat(10000)] },
+      { name: 'Slim', entityType: 't', observations: ['x'.repeat(9999)] },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  assert.equal(report.oversizedEntities.length, 1, '9999 chars stays below the threshold');
+  assert.equal(report.oversizedEntities[0]!.entityName, 'Fat');
+  assert.equal(report.oversizedEntities[0]!.observationCount, 1);
+  assert.equal(report.oversizedEntities[0]!.totalChars, 10000);
+  assert.deepEqual(report.oversizedEntities[0]!.exceeds, ['totalChars']);
+});
+
+test('doctor reports both exceed reasons and sorts oversized entities by totalChars descending', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      // 50 條 × 300 字元 = 15000 字元：條數與字元雙雙達標。
+      {
+        name: 'BothHub',
+        entityType: 't',
+        observations: Array.from(
+          { length: 50 },
+          (_, i) => `${String(i).padStart(3, '0')}${'a'.repeat(297)}`,
+        ),
+      },
+      { name: 'FatOnly', entityType: 't', observations: ['y'.repeat(12000)] },
+      { name: 'Clean', entityType: 't', observations: ['ok'] },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  assert.deepEqual(
+    report.oversizedEntities.map(o => o.entityName),
+    ['BothHub', 'FatOnly'],
+    'sorted by totalChars descending; clean entity absent',
+  );
+  assert.equal(report.oversizedEntities[0]!.totalChars, 15000);
+  assert.deepEqual(report.oversizedEntities[0]!.exceeds, ['observationCount', 'totalChars']);
+  assert.equal(report.oversizedEntities[1]!.totalChars, 12000);
+  assert.deepEqual(report.oversizedEntities[1]!.exceeds, ['totalChars']);
 });
 
 // ---------------------------------------------------------------------------

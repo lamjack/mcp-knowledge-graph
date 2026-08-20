@@ -3,7 +3,7 @@
 import { promises as fs } from 'fs';
 import { existsSync, statSync } from 'fs';
 import path, { isAbsolute } from 'path';
-import { baseMemoryPath, FILE_MARKER, workspaceOnly as configWorkspaceOnly } from './config.js';
+import { baseMemoryPath, FILE_MARKER, workspaceOnly as configWorkspaceOnly, AIM_DIR_NAME, DB_FILE_EXT, DB_FILE_PREFIX, MASTER_DB_FILE } from './config.js';
 
 // `context` 值的允許格式。context 會被插入檔名
 // （`memory-${context}.jsonl`），因此絕不能包含路徑分隔符或目錄穿越段。
@@ -61,7 +61,7 @@ export function assertProjectRootSafe(projectRoot: string): void {
 // 專案偵測 — 搜尋常見的專案標記。
 // .aim 優先檢查：若存在，即為專案本地儲存的明確信號。
 export function findProjectRoot(startDir: string = process.cwd()): string | null {
-  const projectMarkers = ['.aim', '.git', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'];
+  const projectMarkers = [AIM_DIR_NAME, '.git', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'];
   let currentDir = startDir;
   const maxDepth = 5;
 
@@ -85,6 +85,28 @@ export function findProjectRoot(startDir: string = process.cwd()): string | null
   return null;
 }
 
+// database 名 ↔ JSONL 檔名的單一編/解碼點：master 為 memory.jsonl（對外名 'default'），
+// 具名 context 為 memory-<context>.jsonl。集中於此，避免檔名 scheme 散落多處（見 config 的 DB_FILE_* 常量）。
+function dbFileName(context?: string): string {
+  return context ? `${DB_FILE_PREFIX}${context}${DB_FILE_EXT}` : MASTER_DB_FILE;
+}
+
+// 由 JSONL 檔名還原對外資料庫名（master → 'default'），與 dbFileName 互為逆運算。
+function dbNameFromFile(file: string): string {
+  return file === MASTER_DB_FILE ? 'default' : file.replace(DB_FILE_PREFIX, '').replace(DB_FILE_EXT, '');
+}
+
+// 列出某目錄下所有 JSONL 資料庫的對外名稱（排序）。目錄不存在或無法讀取時回空陣列，
+// 與三個呼叫點原先各自「讀取失敗即視為無資料庫」的 try/catch 行為一致。
+async function readDatabaseNames(dir: string): Promise<string[]> {
+  try {
+    const files = await fs.readdir(dir);
+    return files.filter(f => f.endsWith(DB_FILE_EXT)).map(dbNameFromFile).sort();
+  } catch {
+    return [];
+  }
+}
+
 // 依據 context 與可選的 location 覆蓋取得記憶檔案路徑。
 // 匯出供測試使用：驗證多工作區 projectRoot 路由。
 export function getMemoryFilePath(context?: string, location?: 'project' | 'global', projectRoot?: string, workspaceOnly: boolean = configWorkspaceOnly): string {
@@ -92,7 +114,7 @@ export function getMemoryFilePath(context?: string, location?: 'project' | 'glob
   if (context !== undefined) {
     assertContextSafe(context);
   }
-  const filename = context ? `memory-${context}.jsonl` : 'memory.jsonl';
+  const filename = dbFileName(context);
 
   // Workspace-only 嚴格模式：強制帶 projectRoot、停用全域儲存，記憶僅限
   // <projectRoot>/.aim/。缺 projectRoot 或指定 global 一律 fail-closed。
@@ -110,7 +132,7 @@ export function getMemoryFilePath(context?: string, location?: 'project' | 'glob
   // 不受伺服器 cwd 影響。
   if (projectRoot !== undefined) {
     assertProjectRootSafe(projectRoot);
-    const aimDir = path.join(projectRoot, '.aim');
+    const aimDir = path.join(projectRoot, AIM_DIR_NAME);
     const candidate = path.join(aimDir, filename);
     assertInScope(candidate, aimDir);
     return candidate;
@@ -126,7 +148,7 @@ export function getMemoryFilePath(context?: string, location?: 'project' | 'glob
   if (location === 'project') {
     const detectedRoot = findProjectRoot();
     if (detectedRoot) {
-      const aimDir = path.join(detectedRoot, '.aim');
+      const aimDir = path.join(detectedRoot, AIM_DIR_NAME);
       const candidate = path.join(aimDir, filename); // 若 .aim 不存在則會建立
       assertInScope(candidate, aimDir);
       return candidate;
@@ -138,7 +160,7 @@ export function getMemoryFilePath(context?: string, location?: 'project' | 'glob
   // 自動偵測邏輯（既有行為）
   const detectedRoot = findProjectRoot();
   if (detectedRoot) {
-    const aimDir = path.join(detectedRoot, '.aim');
+    const aimDir = path.join(detectedRoot, AIM_DIR_NAME);
     if (existsSync(aimDir)) {
       const candidate = path.join(aimDir, filename);
       assertInScope(candidate, aimDir);
@@ -218,6 +240,14 @@ export interface DoctorReport {
   typeCollisions: { normalized: string; types: string[] }[];
   // 同一 entity 內共用相同 ':' key 前綴的多條 observations（可能是未清理的過時版本）。
   duplicateCandidates: { entityName: string; keyPrefix: string; count: number; observations: string[] }[];
+  // 超大實體警告（advisory）：observation 條數或字元總量達到閾值的實體，依 totalChars 遞減排序。
+  // 超大 hub 實體被 search/get 命中時單次即回傳大量字元，稀釋 context——提示拆分或 prune。
+  oversizedEntities: {
+    entityName: string;
+    observationCount: number;
+    totalChars: number;
+    exceeds: ('observationCount' | 'totalChars')[];
+  }[];
   // 計數與型別分佈統計。
   stats: {
     database: string;
@@ -312,6 +342,13 @@ function relationKey(r: Relation): string {
 function normalizeTypeKey(entityType: string): string {
   return entityType.toLowerCase().replace(/[_-]/g, '');
 }
+
+// 超大實體閾值（達標即列入 doctor 的 oversizedEntities，僅警告不阻斷）。
+// 依據：預設輸出上限 50,000 字元下，單一實體 10k 字元已佔單次回傳預算兩成，
+// 被 search/get 命中一次就大幅稀釋 context；50 條 observation 遠超正常策展粒度
+// （如 SessionLog 10 區塊約 30 條），是「該拆分或 prune 的 hub」的可靠信號。
+const OVERSIZED_OBSERVATION_COUNT = 50;
+const OVERSIZED_TOTAL_CHARS = 10_000;
 
 // 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
 // 正規化後相同、但原字串不同時，回傳一則提醒（不阻斷寫入）。同批內首次出現的新型別
@@ -1067,6 +1104,20 @@ export class KnowledgeGraphManager {
     }
     duplicateCandidates.sort((a, b) => a.entityName.localeCompare(b.entityName) || a.keyPrefix.localeCompare(b.keyPrefix));
 
+    // oversizedEntities：observation 條數或字元總量達閾值的實體（提示拆分/prune 的策展信號）。
+    // 依 totalChars 遞減排序（最重的 hub 在前），同量以名稱穩定排序。
+    const oversizedEntities: DoctorReport['oversizedEntities'] = [];
+    for (const e of graph.entities) {
+      const totalChars = e.observations.reduce((sum, o) => sum + o.length, 0);
+      const exceeds: ('observationCount' | 'totalChars')[] = [];
+      if (e.observations.length >= OVERSIZED_OBSERVATION_COUNT) exceeds.push('observationCount');
+      if (totalChars >= OVERSIZED_TOTAL_CHARS) exceeds.push('totalChars');
+      if (exceeds.length > 0) {
+        oversizedEntities.push({ entityName: e.name, observationCount: e.observations.length, totalChars, exceeds });
+      }
+    }
+    oversizedEntities.sort((a, b) => b.totalChars - a.totalChars || a.entityName.localeCompare(b.entityName));
+
     // stats：計數與型別分佈。
     const entityTypeDistribution: Record<string, number> = {};
     let observationCount = 0;
@@ -1080,6 +1131,7 @@ export class KnowledgeGraphManager {
       danglingRelations,
       typeCollisions,
       duplicateCandidates,
+      oversizedEntities,
       stats: {
         database: context || 'default',
         entityCount: graph.entities.length,
@@ -1115,18 +1167,10 @@ export class KnowledgeGraphManager {
         throw new Error('Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.');
       }
       assertProjectRootSafe(projectRoot);
-      const aimDir = path.join(projectRoot, '.aim');
+      const aimDir = path.join(projectRoot, AIM_DIR_NAME);
       if (existsSync(aimDir)) {
         result.current_location = `workspace-only (${aimDir})`;
-        try {
-          const files = await fs.readdir(aimDir);
-          result.project_databases = files
-            .filter(file => file.endsWith('.jsonl'))
-            .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
-            .sort();
-        } catch (error) {
-          // 目錄存在但無法讀取 — 忽略
-        }
+        result.project_databases = await readDatabaseNames(aimDir);
       } else {
         result.current_location = `workspace-only (no .aim directory yet in ${projectRoot})`;
       }
@@ -1146,18 +1190,10 @@ export class KnowledgeGraphManager {
 
     // 檢查專案本地 .aim 目錄
     if (detectedRoot) {
-      const aimDir = path.join(detectedRoot, '.aim');
+      const aimDir = path.join(detectedRoot, AIM_DIR_NAME);
       if (existsSync(aimDir)) {
         result.current_location = "project (.aim directory detected)";
-        try {
-          const files = await fs.readdir(aimDir);
-          result.project_databases = files
-            .filter(file => file.endsWith('.jsonl'))
-            .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
-            .sort();
-        } catch (error) {
-          // 目錄存在但無法讀取 — 忽略
-        }
+        result.project_databases = await readDatabaseNames(aimDir);
       } else {
         result.current_location = "global (no .aim directory in project)";
       }
@@ -1166,16 +1202,7 @@ export class KnowledgeGraphManager {
     }
 
     // 檢查全域目錄
-    try {
-      const files = await fs.readdir(baseMemoryPath);
-      result.global_databases = files
-        .filter(file => file.endsWith('.jsonl'))
-        .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
-        .sort();
-    } catch (error) {
-      // 目錄不存在或無法讀取
-      result.global_databases = [];
-    }
+    result.global_databases = await readDatabaseNames(baseMemoryPath);
 
     return result;
   }

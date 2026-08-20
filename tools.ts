@@ -573,6 +573,7 @@ RETURNS an object with:
 - danglingRelations: relations whose 'from'/'to' endpoint entity does not exist
 - typeCollisions: groups of entityTypes that differ only by case/underscore/hyphen (e.g. dev_plan vs dev-plan vs DevPlan)
 - duplicateCandidates: within one entity, multiple observations sharing the same ':' key prefix (possible stale versions)
+- oversizedEntities: entities whose observation count (>=50) or total observation characters (>=10,000) reach curation thresholds, sorted by totalChars descending. Advisory only: such hub entities eat a large share of the output budget whenever search/get matches them - split them into smaller entities or prune stale observations
 - stats: entity/relation/observation counts and per-entityType distribution for the audited database
 
 This never mutates the graph and never exposes secrets beyond what is already stored.
