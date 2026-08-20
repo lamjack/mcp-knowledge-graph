@@ -16,6 +16,7 @@ MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供
 
 - Install: `npm install`
 - Build: `npm run build`（輸出 `dist/`，`tsc -p tsconfig.build.json`）
+- 編輯器 TS：`.vscode/settings.json` 已把編輯器 tsserver 釘到 workspace 的 `node_modules/typescript`（Devin IDE 內建 TS 6.0（`types` 預設 `[]`）曾造成 `Cannot find name 'node:test'` 等假錯誤）；根 tsconfig 已顯式 `"types": ["node"]`，兩者缺一不可留意勿刪。
 - 部署事實：使用者的 aim-memory MCP 直接從本 repo 跑（`node dist/index.js --workspace-only`）；**改完必須 `npm run build` 並重啟 MCP server（Windsurf reload）才生效**。
 
 ## Testing

@@ -1,0 +1,7 @@
+{
+  // 把編輯器的 TypeScript 釘到 workspace 版本（node_modules/typescript 5.9.x），
+  // 讓編輯器診斷與 CLI（npm run build / npm test）完全一致。
+  // Devin IDE / Windsurf 用 js/ts.tsdk.path；typescript.tsdk 為 VS Code 標準鍵，兩者並列以相容各分支。
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "typescript.tsdk": "node_modules/typescript/lib"
+}
