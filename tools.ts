@@ -204,17 +204,23 @@ EXAMPLES:
   },
   {
     name: "aim_memory_remove_facts",
-    description: `Remove specific facts from a memory. Keeps the memory but removes selected observations.
+    description: `Remove specific facts from a memory. Keeps the memory but removes selected observations, either by exact text or by prefix.
 
-DATABASE SELECTION: Observations are deleted from entities within the specified database's knowledge graph.
+MATCH MODES (per deletion entry, provide exactly one, non-empty):
+- observations: ["full exact text", ...] - deletes observations identical to any given string
+- observationPrefix: "session 2026-08-01T10:00:00+08:00｜" - deletes EVERY observation starting with this prefix. The natural way to prune a whole prefixed block without transcribing long/CJK text (exact matching of long strings is brittle and silently matched nothing in the past).
 
-LOCATION OVERRIDE: Use the 'location' parameter to force deletion from 'project' (.aim directory) or 'global' (configured directory). Leave blank for auto-detection.
+RETURNS: Per-entity report array [{entityName, entityExists, requested, removed, unmatched}] - you can ALWAYS tell how much was actually deleted:
+- requested: deletion items given (exact mode: distinct string count; prefix mode: 1)
+- removed: observations actually deleted
+- unmatched: requested items that matched nothing (exact mode: the unmatched strings; prefix mode echoes the prefix when 0 matched)
+- entityExists:false: no such entity - nothing deleted for that name, other entries still processed
+- A call that removes nothing does not modify the file at all.
 
 EXAMPLES:
-- Master database (default): aim_memory_remove_facts({deletions: [{entityName: "John", observations: ["Outdated info"]}]})
-- Work database: aim_memory_remove_facts({context: "work", deletions: [{entityName: "Project", observations: ["Old deadline"]}]})
-- Master database in global location: aim_memory_remove_facts({location: "global", deletions: [{entityName: "John", observations: ["Outdated info"]}]})
-- Health database in project location: aim_memory_remove_facts({context: "health", location: "project", deletions: [{entityName: "Exercise", observations: ["Injured knee"]}]})`,
+- Exact: aim_memory_remove_facts({deletions: [{entityName: "John", observations: ["Outdated info"]}]})
+- Prefix (prune a whole block): aim_memory_remove_facts({deletions: [{entityName: "Log", observationPrefix: "session 2026-08-01T10:00:00+08:00｜"}]})
+- Verify afterwards with aim_memory_count_observations or aim_memory_get({observationPrefix: ...})`,
     inputSchema: {
       type: "object",
       properties: {
@@ -233,10 +239,14 @@ EXAMPLES:
               observations: {
                 type: "array",
                 items: { type: "string" },
-                description: "An array of observations to delete"
+                description: "Observations to delete by exact text. Provide exactly one of observations or observationPrefix per entry."
+              },
+              observationPrefix: {
+                type: "string",
+                description: "Delete every observation starting with this prefix. Provide exactly one of observations or observationPrefix per entry."
               },
             },
-            required: ["entityName", "observations"],
+            required: ["entityName"],
           },
         },
       },
@@ -374,6 +384,11 @@ EXAMPLES:
 
 VS aim_memory_search: Use aim_memory_get for exact name lookup. Use aim_memory_search for fuzzy matching or when you don't know exact names.
 
+OBSERVATION FILTER (optional, at most one):
+- observationPrefix: keep only observations starting with this text
+- observationSubstring: keep only observations containing this text
+When a filter is active, each returned entity contains only the matching observations (entities with 0 matches are kept with empty observations, so "no match" is distinguishable from "no such entity"), and the output is prefixed with an "[obs-filter]" header reporting matched/total counts. Ideal for inspecting or verifying prefix-scoped blocks (e.g. session logs) without pulling a whole large entity that could hit the output cap.
+
 RETURNS: Requested entities and relations between them. Non-existent names are silently ignored.
 
 FORMAT OPTIONS:
@@ -383,6 +398,7 @@ FORMAT OPTIONS:
 EXAMPLES:
 - aim_memory_get({names: ["John", "TechConf2024"]}) - JSON format
 - aim_memory_get({names: ["Shane"], format: "pretty"}) - Human-readable
+- aim_memory_get({names: ["Log"], observationPrefix: "session "}) - only session-prefixed observations
 - aim_memory_get({context: "work", names: ["Q4_Project"], format: "pretty"})`,
     inputSchema: {
       type: "object",
@@ -400,8 +416,62 @@ EXAMPLES:
         },
         format: formatProp,
         includeObservations: includeObservationsProp,
+        observationPrefix: {
+          type: "string",
+          description: "Optional. Keep only observations starting with this text. Provide at most one of observationPrefix or observationSubstring."
+        },
+        observationSubstring: {
+          type: "string",
+          description: "Optional. Keep only observations containing this text. Provide at most one of observationPrefix or observationSubstring."
+        },
       },
       required: ["names"],
+    },
+  },
+  {
+    name: "aim_memory_count_observations",
+    description: `Count observations on given entities by prefix - read-only, returns counts instead of observation bodies.
+
+WHY: Deciding whether a prefix-scoped block needs pruning (e.g. "how many session blocks does this SessionLog have, and what are their timestamps?") should not require pulling full observation text - a large entity can hit the output cap. This tool answers the counting question directly with a tiny payload.
+
+PARAMS:
+- names: entities to inspect (required)
+- observationPrefix: only count observations starting with this prefix (required)
+- groupByDelimiter (optional): group matched observations by their text from the start through the FIRST occurrence of this delimiter (inclusive). E.g. observationPrefix "session " + groupByDelimiter "｜" yields one group per "session <timestamp>｜" block. Matched observations lacking the delimiter group under their full text.
+
+RETURNS: Array of {entityName, entityExists, totalObservations, matched, groups?}:
+- totalObservations: all observations on the entity (unfiltered)
+- matched: observations starting with the prefix
+- groups: [{key, count}] sorted by key - only present when groupByDelimiter is given
+- entityExists:false -> totalObservations/matched are 0 (no such entity; other names still processed)
+
+EXAMPLES:
+- aim_memory_count_observations({names: ["Log"], observationPrefix: "session "})
+- aim_memory_count_observations({names: ["Log"], observationPrefix: "session ", groupByDelimiter: "｜"})`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectRoot: projectRootProp,
+        context: {
+          type: "string",
+          description: "Optional memory context. Counts observations in the specified context's knowledge graph, or the master database if not specified."
+        },
+        location: locationProp,
+        names: {
+          type: "array",
+          items: { type: "string" },
+          description: "An array of entity names to inspect",
+        },
+        observationPrefix: {
+          type: "string",
+          description: "Only count observations starting with this prefix.",
+        },
+        groupByDelimiter: {
+          type: "string",
+          description: "Optional. Group matched observations by their text up to and including the first occurrence of this delimiter (e.g. '｜').",
+        },
+      },
+      required: ["names", "observationPrefix"],
     },
   },
   {

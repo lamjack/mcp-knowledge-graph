@@ -176,6 +176,38 @@ export interface CreateEntitiesResult {
   warnings: string[];
 }
 
+// deleteObservations 的單一刪除目標：observations（逐字精確）與 observationPrefix（前綴）
+// 恰擇一且非空。前綴模式是 prune 的自然表達（「刪掉前綴 session <ts>｜ 的全部 observation」），
+// 避免長 / CJK 字串逐字比對失敗造成的靜默 no-op。
+export interface DeleteObservationsEntry {
+  entityName: string;
+  observations?: string[] | undefined;
+  observationPrefix?: string | undefined;
+}
+
+// 每個 entity 的刪除回報：任何情況都能分辨「全刪 / 部分刪 / 一條沒刪 / entity 不存在」。
+// requested：要求刪除的項目數（exact 模式為去重後字串數、前綴模式為 1）；
+// removed：實際刪除的 observation 數；
+// unmatched：未命中的要求（exact 為未命中的字串、前綴 0 命中時回顯該前綴）。
+export interface DeleteObservationsResult {
+  entityName: string;
+  entityExists: boolean;
+  requested: number;
+  removed: number;
+  unmatched: string[];
+}
+
+// countObservations 的 per-entity 唯讀回報（不回 observation 本文）。groups 僅在提供
+// groupByDelimiter 時存在：key 為命中 observation 開頭到首個分隔符（含）的片段；
+// 命中但不含分隔符者以全文為 key。
+export interface ObservationCountResult {
+  entityName: string;
+  entityExists: boolean;
+  totalObservations: number;
+  matched: number;
+  groups?: { key: string; count: number }[] | undefined;
+}
+
 // aim_memory_doctor 的唯讀審計報告。所有欄位皆為新計算的純資料（不與快取共用參考）。
 export interface DoctorReport {
   // 無任何 relation 端點的 entity 名單（名稱序）。
@@ -599,19 +631,105 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async deleteObservations(deletions: { entityName: string; observations: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<void> {
+  // 刪除 observation 並如實回報每個 entity 的結果（消滅靜默失敗：entity 不存在或
+  // 0 命中都明確可辨，不再無差別回「成功」）。每個 entry 的 observations（逐字精確）
+  // 與 observationPrefix（前綴整批）恰擇一且非空；全部 entry 先驗證再碰圖譜，
+  // 無效呼叫不產生部分寫入。整批一條都沒刪成時不寫檔（比照 replaceFact 不觸碰 mtime）。
+  async deleteObservations(deletions: DeleteObservationsEntry[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<DeleteObservationsResult[]> {
+    type DeleteSpec =
+      | { kind: 'exact'; entityName: string; requested: string[]; toRemove: Set<string> }
+      | { kind: 'prefix'; entityName: string; prefix: string };
+    const specs: DeleteSpec[] = deletions.map(d => {
+      const hasExact = d.observations !== undefined && d.observations.length > 0;
+      const hasPrefix = d.observationPrefix !== undefined && d.observationPrefix !== '';
+      if (hasExact === hasPrefix) {
+        throw new Error(`deleteObservations requires exactly one of observations or observationPrefix per entry (entity "${d.entityName}")`);
+      }
+      if (hasPrefix) {
+        return { kind: 'prefix', entityName: d.entityName, prefix: d.observationPrefix! };
+      }
+      const requested = [...new Set(d.observations!)];
+      return { kind: 'exact', entityName: d.entityName, requested, toRemove: new Set(requested) };
+    });
+
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {
       const graph = await this.loadGraph(filePath);
       const byName = new Map(graph.entities.map(e => [e.name, e] as const));
-      deletions.forEach(d => {
-        const entity = byName.get(d.entityName);
-        if (entity) {
-          const toRemove = new Set(d.observations);
-          entity.observations = entity.observations.filter(o => !toRemove.has(o));
+      let totalRemoved = 0;
+      const results: DeleteObservationsResult[] = specs.map(spec => {
+        const requestedCount = spec.kind === 'exact' ? spec.requested.length : 1;
+        const entity = byName.get(spec.entityName);
+        if (!entity) {
+          return {
+            entityName: spec.entityName,
+            entityExists: false,
+            requested: requestedCount,
+            removed: 0,
+            unmatched: spec.kind === 'exact' ? [...spec.requested] : [spec.prefix],
+          };
         }
+        const present = new Set(entity.observations);
+        const kept = spec.kind === 'exact'
+          ? entity.observations.filter(o => !spec.toRemove.has(o))
+          : entity.observations.filter(o => !o.startsWith(spec.prefix));
+        const removed = entity.observations.length - kept.length;
+        totalRemoved += removed;
+        if (removed > 0) entity.observations = kept;
+        const unmatched = spec.kind === 'exact'
+          ? spec.requested.filter(s => !present.has(s))
+          : removed === 0 ? [spec.prefix] : [];
+        return { entityName: spec.entityName, entityExists: true, requested: requestedCount, removed, unmatched };
       });
-      await this.saveGraph(graph, filePath);
+      if (totalRemoved > 0) {
+        await this.saveGraph(graph, filePath);
+      }
+      return results;
+    });
+  }
+
+  // 唯讀前綴計數：回傳每個 entity 的 observation 總數與前綴命中數，可選以
+  // groupByDelimiter 分組（key＝開頭到首個分隔符（含）的片段）。不回 observation 本文，
+  // 讓「entity 內某前綴有幾個分組、各自 key 是什麼」不需全量拉取即可回答
+  // （SessionLog prune 的決策依據）。entity 不存在時如實回報 entityExists:false。
+  async countObservations(names: string[], observationPrefix: string, groupByDelimiter?: string, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<ObservationCountResult[]> {
+    if (typeof observationPrefix !== 'string' || observationPrefix === '') {
+      throw new Error('countObservations requires a non-empty observationPrefix');
+    }
+    const delimiter = groupByDelimiter !== undefined && groupByDelimiter !== '' ? groupByDelimiter : undefined;
+    const graph = await this.loadGraphShared(this.resolvePath(context, location, projectRoot));
+    const byName = new Map(graph.entities.map(e => [e.name, e] as const));
+    return names.map(name => {
+      const entity = byName.get(name);
+      if (!entity) {
+        return {
+          entityName: name,
+          entityExists: false,
+          totalObservations: 0,
+          matched: 0,
+          groups: delimiter !== undefined ? [] : undefined,
+        };
+      }
+      const hits = entity.observations.filter(o => o.startsWith(observationPrefix));
+      let groups: { key: string; count: number }[] | undefined;
+      if (delimiter !== undefined) {
+        const counts = new Map<string, number>();
+        for (const o of hits) {
+          const idx = o.indexOf(delimiter);
+          const key = idx >= 0 ? o.slice(0, idx + delimiter.length) : o;
+          counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+        groups = [...counts.entries()]
+          .map(([key, count]) => ({ key, count }))
+          .sort((a, b) => a.key.localeCompare(b.key));
+      }
+      return {
+        entityName: name,
+        entityExists: true,
+        totalObservations: entity.observations.length,
+        matched: hits.length,
+        groups,
+      };
     });
   }
 

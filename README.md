@@ -167,11 +167,11 @@ my-project/
 - `aim_memory_add_facts` — 向既有記憶新增事實
 - `aim_memory_link` — 連結兩個記憶。**預設對不存在的端點報錯**（防幽靈節點）；傳 `allowDangling:true` 可還原舊的寬鬆行為
 - `aim_memory_search` — 依關鍵字搜尋記憶
-- `aim_memory_get` — 依確切名稱擷取特定記憶
+- `aim_memory_get` — 依確切名稱擷取特定記憶；可選 `observationPrefix` / `observationSubstring` 只回命中條目（附 `[obs-filter]` 抬頭報命中/總數）
 - `aim_memory_read_all` — 讀取資料庫中所有記憶
 - `aim_memory_list_stores` — 列出可用資料庫
 - `aim_memory_forget` — 遺忘記憶
-- `aim_memory_remove_facts` — 移除記憶中的特定事實
+- `aim_memory_remove_facts` — 移除記憶中的特定事實（逐字精確或前綴整批）。**回傳 per-entity 結構化報告** `[{entityName, entityExists, requested, removed, unmatched}]`：任何情況都能分辨全刪／部分刪／一條沒刪／entity 不存在；一條沒刪成時不寫檔
 - `aim_memory_unlink` — 移除記憶之間的連結
 
 ### 策展與防呆工具
@@ -180,6 +180,7 @@ my-project/
 - `aim_memory_replace_fact` — 原子「刪舊補新」：刪除某實體所有命中（`matchPrefix` 或 `matchSubstring` 二擇一）的 observation，並在**同一次寫入**追加 `newText`。回傳 `{matched, replaced}`；0 命中時不追加並回傳 `{matched:0, replaced:false}`（不靜默 no-op）。適合取代 key 型 observation（如「開發計畫編號: ...」）。參數：`entityName`、`newText`（必填）、`matchPrefix?`/`matchSubstring?`（恰一）
 - `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 `:` key 前綴的多條 observation）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
 - `aim_memory_list_entity_types` — 唯讀，回傳各 `entityType` 與其實體計數（數量多者在前），供型別詞彙治理
+- `aim_memory_count_observations` — 唯讀 observation 計數（**不回本文**）：對指定 entities 回傳 `{entityName, entityExists, totalObservations, matched, groups?}`；`observationPrefix` 必填，加 `groupByDelimiter`（如 `｜`）可把命中條目按「開頭到首個分隔符」分組回傳 `[{key, count}]`。回答「entity 內某前綴有幾個分組、各自 key 是什麼」不需全量拉取，是 SessionLog prune 的決策與刪後核實工具
 
 ### 參數
 
@@ -190,6 +191,8 @@ my-project/
 - `limit`（可選，`aim_memory_search`）— 只回傳相關性最高的前 N 個命中實體（seeds）。相關性排序：name 完全命中 > name 子字串 > type > observation。由 `depth` 帶入的鄰居不計入此上限
 - `depth`（可選，`aim_memory_search`，預設 `1`）— 由每個命中實體向外擴展的關係跳數，帶入鄰居提供脈絡。設為 `0` 只回傳命中實體與其之間的關係
 - `includeObservations`（可選，`aim_memory_read_all` / `aim_memory_get`，預設 `true`）— 設為 `false` 時只回傳每個 entity 的 `name` + `entityType`（省略 observations）與完整關係骨架，供審計/索引大圖時避免數百 KB 輸出被截斷
+- `observationPrefix` / `observationSubstring`（可選，`aim_memory_get`，恰擇一）— observation 級過濾：每個 entity 只保留命中條目（0 命中的 entity 保留空 observations，可與「entity 不存在」分辨），輸出前置 `[obs-filter]` 抬頭報命中/總數
+- `observationPrefix`（`aim_memory_remove_facts` 的 deletion entry，與 `observations` 恰一且非空）— 前綴整批刪除：刪掉該 entity 上所有此前綴開頭的 observation，免逐字轉錄長/CJK 全文
 - `offset` / `limit`（可選，`aim_memory_read_all`）— 以 entity 為單位分批讀取大圖；relations 骨架每頁完整回傳。帶分頁時輸出前置 `[page]` 抬頭，標示本頁範圍與下一頁的 `offset`
 
 ### 輸出大小上限與自動分頁
@@ -198,7 +201,7 @@ my-project/
 
 - **`read_all` 未帶 `offset`/`limit` 且全圖超過上限**：自動降級為「放得進預算的最大第一頁」（entity 邊界切齊、relations 骨架完整、格式保持有效），前置 `[page]` 抬頭附下一頁 `offset`——逐頁續讀即可走完全圖，不會收到截斷的破損 JSON。
 - **明確分頁（帶 `offset`/`limit`）後仍超過上限**：退回硬性截斷並附指引（請縮小 `limit`）；`search` / `get` 超限同樣走硬性截斷。
-- 大圖建議搭配 `includeObservations: false` 或 `format: "concise"` 先讀骨架，再對目標實體取完整內容。
+- 大圖建議搭配 `includeObservations: false` 或 `format: "concise"` 先讀骨架，再對目標實體取完整內容；只要某前綴的條目時用 `aim_memory_get` 的 `observationPrefix`，只要計數/分組時用 `aim_memory_count_observations`（不回本文）
 - `allowDangling`（可選，`aim_memory_link`，預設 `false`）— 逃生門。預設會拒絕指向不存在端點的連結；設 `true` 允許建立端點尚不存在的關係（舊寬鬆行為）
 
 ### 錯誤通道

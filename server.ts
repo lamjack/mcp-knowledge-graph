@@ -17,6 +17,7 @@ import {
   type KnowledgeGraph,
   type Entity,
   type Relation,
+  type DeleteObservationsEntry,
 } from './storage.js';
 import { TOOL_DEFINITIONS } from './tools.js';
 
@@ -39,6 +40,37 @@ export function projectObservations(graph: KnowledgeGraph, includeObservations: 
     };
   }
   return graph;
+}
+
+// aim_memory_get 的 observation 級過濾（server 層，不改動 storage 讀取 API）：
+// observationPrefix 或 observationSubstring 恰擇一（並給報錯，走 isError 通道）。
+// 啟動時每個 entity 只保留命中條目，並產生一行 [obs-filter] 抬頭報命中/總數；
+// 0 命中的 entity 保留（空 observations），讓「無命中」可與「entity 不存在」分辨——
+// 這正是刪除後核實落盤狀態所需的證據。未啟動過濾時原樣透傳（同一參考，向後相容）。
+export function filterObservations(graph: KnowledgeGraph, rawPrefix: unknown, rawSubstring: unknown): { graph: KnowledgeGraph; header: string | null } {
+  const prefix = typeof rawPrefix === 'string' && rawPrefix !== '' ? rawPrefix : undefined;
+  const substring = typeof rawSubstring === 'string' && rawSubstring !== '' ? rawSubstring : undefined;
+  if (prefix !== undefined && substring !== undefined) {
+    throw new Error('aim_memory_get accepts at most one of observationPrefix or observationSubstring');
+  }
+  if (prefix === undefined && substring === undefined) return { graph, header: null };
+
+  const predicate = prefix !== undefined
+    ? (o: string) => o.startsWith(prefix)
+    : (o: string) => o.includes(substring!);
+  let total = 0;
+  let matched = 0;
+  let entitiesMatched = 0;
+  const entities = graph.entities.map(e => {
+    total += e.observations.length;
+    const kept = e.observations.filter(predicate);
+    matched += kept.length;
+    if (kept.length > 0) entitiesMatched++;
+    return { ...e, observations: kept };
+  });
+  const by = prefix !== undefined ? `prefix="${prefix}"` : `substring="${substring}"`;
+  const header = `[obs-filter] ${by}: matched ${matched} of ${total} observations across ${entitiesMatched} of ${entities.length} entities`;
+  return { graph: { entities, relations: graph.relations }, header };
 }
 
 // 分頁結果的中繼資訊。entity 是觀察值的載體（大圖體積的主要來源），故分頁作用於 entity 清單；
@@ -177,8 +209,7 @@ async function dispatchTool(request: CallToolRequest) {
       await knowledgeGraphManager.deleteEntities(args.entityNames as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
       return { content: [{ type: "text", text: "Entities deleted successfully" }] };
     case "aim_memory_remove_facts":
-      await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
-      return { content: [{ type: "text", text: "Observations deleted successfully" }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.deleteObservations(args.deletions as DeleteObservationsEntry[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string), null, 2) }] };
     case "aim_memory_unlink":
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
@@ -211,8 +242,22 @@ async function dispatchTool(request: CallToolRequest) {
     }
     case "aim_memory_get": {
       const graph = await knowledgeGraphManager.openNodes(args.names as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
-      const projected = projectObservations(graph, args.includeObservations);
-      return { content: [{ type: "text", text: capText(formatGraph(projected, args.format, args.context as string), maxOutputChars) }] };
+      // observation 級過濾（可選）：只留命中條目並附 [obs-filter] 抬頭；未啟動時原樣。
+      const { graph: filtered, header } = filterObservations(graph, args.observationPrefix, args.observationSubstring);
+      const projected = projectObservations(filtered, args.includeObservations);
+      const text = formatGraph(projected, args.format, args.context as string);
+      return { content: [{ type: "text", text: capText(header ? `${header}\n${text}` : text, maxOutputChars) }] };
+    }
+    case "aim_memory_count_observations": {
+      const report = await knowledgeGraphManager.countObservations(
+        args.names as string[],
+        args.observationPrefix as string,
+        args.groupByDelimiter as string | undefined,
+        args.context as string,
+        args.location as 'project' | 'global',
+        args.projectRoot as string,
+      );
+      return { content: [{ type: "text", text: capText(JSON.stringify(report, null, 2), maxOutputChars) }] };
     }
     case "aim_memory_list_stores":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(args.projectRoot as string), null, 2) }] };
