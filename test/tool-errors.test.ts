@@ -66,6 +66,25 @@ test('replace_fact 缺 newText：回傳 isError 結構化結果（非協議級 -
   assertIsErrorResult(bad, /Missing required argument\(s\).*newText/, 'replace_fact 缺 newText');
 });
 
+test('未知工具名稱：回傳可辨識的 "Unknown tool" isError 結果，而非隱晦的 undefined 存取錯誤', async () => {
+  const root = tmpRoot();
+  const out = await driveServer(
+    ['--workspace-only'],
+    [
+      INIT,
+      INITIALIZED,
+      call(2, 'aim_memory_does_not_exist', { projectRoot: root }),
+      // 未知工具不得殺掉 server：後續合法呼叫仍須正常。
+      call(3, 'aim_memory_list_stores', { projectRoot: root }),
+    ],
+    3,
+  );
+  const bad = out.find(m => m.id === 2);
+  assertIsErrorResult(bad, /Unknown tool: aim_memory_does_not_exist/, '未知工具名稱');
+  const alive = out.find(m => m.id === 3);
+  assert.ok(alive?.result && !alive.error, '未知工具之後同一 server 行程必須繼續正常服務');
+});
+
 test('replace_fact 目標實體不存在：儲存層錯誤同樣回傳 isError 結構化結果', async () => {
   const root = tmpRoot();
   const out = await driveServer(

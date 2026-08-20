@@ -164,7 +164,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // 這裡略過以免蓋掉 workspace-only 的專屬提示。
 function assertRequiredArgs(toolName: string, args: Record<string, unknown>): void {
   const tool = TOOL_DEFINITIONS.find(t => t.name === toolName);
-  const required = (tool?.inputSchema as { required?: string[] }).required ?? [];
+  // 未知工具在此就明確報錯：否則下面存取 undefined.inputSchema 會丟出隱晦的 TypeError
+  // （"Cannot read properties of undefined"），且早於 dispatchTool 的 switch，讓其
+  // default 分支的 "Unknown tool" 訊息對「名稱不在定義」的情況永遠走不到。
+  if (!tool) {
+    throw new Error(`Unknown tool: ${toolName}`);
+  }
+  const required = (tool.inputSchema as { required?: string[] }).required ?? [];
   const missing = required.filter(key => key !== 'projectRoot' && args[key] === undefined);
   if (missing.length > 0) {
     throw new Error(`Missing required argument(s) for ${toolName}: ${missing.join(', ')}`);
@@ -194,38 +200,44 @@ async function dispatchTool(request: CallToolRequest) {
 
   assertRequiredArgs(name, args as Record<string, unknown>);
 
+  // 「選哪個 store」的三元組在每個工具都以相同尾隨參數傳給 storage 層；
+  // 在此解構一次，取代各 case 重複的 `args.context as ... , args.location as ... , args.projectRoot as ...` cast。
+  const context = args.context as string | undefined;
+  const location = args.location as 'project' | 'global' | undefined;
+  const projectRoot = args.projectRoot as string | undefined;
+
   switch (name) {
     case "aim_memory_store": {
-      const result = await knowledgeGraphManager.createEntities(args.entities as Entity[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      const result = await knowledgeGraphManager.createEntities(args.entities as Entity[], context, location, projectRoot);
       // 向後相容：無 warning 時維持純陣列輸出；有 warning 時才包成 {entities, warnings} 物件。
       const payload = result.warnings.length > 0 ? { entities: result.entities, warnings: result.warnings } : result.entities;
       return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
     }
     case "aim_memory_link":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createRelations(args.relations as Relation[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string, args.allowDangling as boolean | undefined), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createRelations(args.relations as Relation[], context, location, projectRoot, args.allowDangling as boolean | undefined), null, 2) }] };
     case "aim_memory_add_facts":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[], context, location, projectRoot), null, 2) }] };
     case "aim_memory_forget":
-      await knowledgeGraphManager.deleteEntities(args.entityNames as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      await knowledgeGraphManager.deleteEntities(args.entityNames as string[], context, location, projectRoot);
       return { content: [{ type: "text", text: "Entities deleted successfully" }] };
     case "aim_memory_remove_facts":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.deleteObservations(args.deletions as DeleteObservationsEntry[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.deleteObservations(args.deletions as DeleteObservationsEntry[], context, location, projectRoot), null, 2) }] };
     case "aim_memory_unlink":
-      await knowledgeGraphManager.deleteRelations(args.relations as Relation[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      await knowledgeGraphManager.deleteRelations(args.relations as Relation[], context, location, projectRoot);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "aim_memory_read_all": {
-      const graph = await knowledgeGraphManager.readGraph(args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      const graph = await knowledgeGraphManager.readGraph(context, location, projectRoot);
       const projected = projectObservations(graph, args.includeObservations);
       // entity 分頁：切片後才格式化，讓大圖可分批讀取；有分頁時前置抬頭告知進度與下一頁 offset。
       const { graph: paged, pageInfo } = paginateGraph(projected, args.offset, args.limit);
-      let text = formatGraph(paged, args.format, args.context as string);
+      let text = formatGraph(paged, args.format, context);
       if (pageInfo) {
         // 明確分頁後仍超過上限：批次大小由呼叫端掌控，退回硬性截斷作最後防線。
         text = capText(`${pageHeader(pageInfo)}\n${text}`, maxOutputChars);
       } else if (text.length > maxOutputChars) {
         // 未分頁的全圖讀取超過上限：自動降級為第一頁（格式完整、附續讀 offset），
         // 連一個 entity 都放不下才退回硬性截斷。絕不回傳撐爆客戶端的巨量文字。
-        text = autoPaginateText(projected, args.format, args.context as string, maxOutputChars)
+        text = autoPaginateText(projected, args.format, context, maxOutputChars)
           ?? capText(text, maxOutputChars);
       }
       return { content: [{ type: "text", text }] };
@@ -233,19 +245,17 @@ async function dispatchTool(request: CallToolRequest) {
     case "aim_memory_search": {
       const graph = await knowledgeGraphManager.searchNodes(
         args.query as string,
-        args.context as string,
-        args.location as 'project' | 'global',
-        args.projectRoot as string,
+        context, location, projectRoot,
         { limit: args.limit as number | undefined, depth: args.depth as number | undefined },
       );
-      return { content: [{ type: "text", text: capText(formatGraph(graph, args.format, args.context as string), maxOutputChars) }] };
+      return { content: [{ type: "text", text: capText(formatGraph(graph, args.format, context), maxOutputChars) }] };
     }
     case "aim_memory_get": {
-      const graph = await knowledgeGraphManager.openNodes(args.names as string[], args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      const graph = await knowledgeGraphManager.openNodes(args.names as string[], context, location, projectRoot);
       // observation 級過濾（可選）：只留命中條目並附 [obs-filter] 抬頭；未啟動時原樣。
       const { graph: filtered, header } = filterObservations(graph, args.observationPrefix, args.observationSubstring);
       const projected = projectObservations(filtered, args.includeObservations);
-      const text = formatGraph(projected, args.format, args.context as string);
+      const text = formatGraph(projected, args.format, context);
       return { content: [{ type: "text", text: capText(header ? `${header}\n${text}` : text, maxOutputChars) }] };
     }
     case "aim_memory_count_observations": {
@@ -253,21 +263,17 @@ async function dispatchTool(request: CallToolRequest) {
         args.names as string[],
         args.observationPrefix as string,
         args.groupByDelimiter as string | undefined,
-        args.context as string,
-        args.location as 'project' | 'global',
-        args.projectRoot as string,
+        context, location, projectRoot,
       );
       return { content: [{ type: "text", text: capText(JSON.stringify(report, null, 2), maxOutputChars) }] };
     }
     case "aim_memory_list_stores":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(args.projectRoot as string), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(projectRoot), null, 2) }] };
     case "aim_memory_update_entity": {
       const updated = await knowledgeGraphManager.updateEntity(
         args.name as string,
         { newName: args.newName as string | undefined, entityType: args.entityType as string | undefined },
-        args.context as string,
-        args.location as 'project' | 'global',
-        args.projectRoot as string,
+        context, location, projectRoot,
       );
       return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
     }
@@ -276,18 +282,16 @@ async function dispatchTool(request: CallToolRequest) {
         args.entityName as string,
         { prefix: args.matchPrefix as string | undefined, substring: args.matchSubstring as string | undefined },
         args.newText as string,
-        args.context as string,
-        args.location as 'project' | 'global',
-        args.projectRoot as string,
+        context, location, projectRoot,
       );
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
     case "aim_memory_doctor": {
-      const report = await knowledgeGraphManager.doctor(args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      const report = await knowledgeGraphManager.doctor(context, location, projectRoot);
       return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
     }
     case "aim_memory_list_entity_types": {
-      const types = await knowledgeGraphManager.listEntityTypes(args.context as string, args.location as 'project' | 'global', args.projectRoot as string);
+      const types = await knowledgeGraphManager.listEntityTypes(context, location, projectRoot);
       return { content: [{ type: "text", text: JSON.stringify(types, null, 2) }] };
     }
     default:
