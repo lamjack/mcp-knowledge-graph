@@ -248,6 +248,21 @@ export interface DoctorReport {
     totalChars: number;
     exceeds: ('observationCount' | 'totalChars')[];
   }[];
+  // 流水帳漂移：key 頭內嵌日期的 observation 每寫一次就生成一個新鍵，結構上永遠無法被後續
+  // 事實覆蓋，於是實體從「當前狀態」退化為「歷次快照堆積」。兩種命中條件：
+  //   1. datedKeys 達門檻——日期已成為該實體的組織主軸；
+  //   2. sameSlotGroups 非空——多個鍵剝掉日期後指向同一個槽（如 "deploy (2026-08-12)"
+  //      與 "deploy (2026-08-20)"），這類同事重複 duplicateCandidates 全盲，因為每個鍵都相異。
+  // keyPrefixes 可直接餵給 remove_facts 的 observationPrefix 清理。SessionLog 型別豁免。
+  journalEntities: {
+    entityName: string;
+    datedKeys: number;
+    totalObservations: number;
+    sameSlotGroups: { slot: string; count: number; keyPrefixes: string[] }[];
+  }[];
+  // 未結案標記：仍寫著 TODO / 待確認 之類的 observation。它們是「當時沒定案」的事實，
+  // 定案後常沒人回頭改，於是無限期陳舊。excerpts 截斷至 120 字元以控制報告體積。
+  unresolvedMarkers: { entityName: string; count: number; markers: string[]; excerpts: string[] }[];
   // 計數與型別分佈統計。
   stats: {
     database: string;
@@ -349,6 +364,58 @@ function normalizeTypeKey(entityType: string): string {
 // （如 SessionLog 10 區塊約 30 條），是「該拆分或 prune 的 hub」的可靠信號。
 const OVERSIZED_OBSERVATION_COUNT = 50;
 const OVERSIZED_TOTAL_CHARS = 10_000;
+
+// observation 的 key 頭：首個 ':' 或全形 '：' 之前的片段（已 trim）。半形與全形一律
+// 視為分隔符——中文書寫常用全形，只認半形會讓「別名：a / 別名：b」這類真重複永遠漏檢。
+// 無分隔符、以分隔符開頭、或 key 頭為空者回 undefined（視為無鍵 observation）。
+export function keyHeadOf(observation: string): string | undefined {
+  const half = observation.indexOf(':');
+  const full = observation.indexOf('：');
+  const idx = half < 0 ? full : full < 0 ? half : Math.min(half, full);
+  if (idx <= 0) return undefined;
+  const head = observation.slice(0, idx).trim();
+  return head === '' ? undefined : head;
+}
+
+// key 頭中的日期。鍵一旦帶日期就每寫一次生成一個新鍵，後續事實在結構上永遠無法覆蓋它
+// ——這正是 journalEntities 要抓的形態。
+// ⚠️ 只認四位年份 + `-` 或 `/` 分隔的完整日期（2026-08-12 / 2026/8/12）。兩次收緊都是被
+// 誤報逼出來的：先放寬到 08-12 短式，把版本號 v3000.4.25 的 "4.25" 當成日期；改成強制
+// 四位年份後 "3000.4.25" 整串仍完全符合 \d{4}.\d{1,2}.\d{1,2}——點分版本號與點分日期在
+// 結構上無法區分。點號因此排除。誤報會讓整個區段被無視，寧可漏掉 2026.08.12 這種寫法
+// （實測兩個真實圖譜清一色用連字號）也不要污染信號。
+const DATE_PATTERN = String.raw`\d{4}[-/]\d{1,2}[-/]\d{1,2}`;
+const DATE_IN_KEY = new RegExp(DATE_PATTERN);
+// 內含日期的括號整組（半形/全形/方括號）。整組剝除才能讓
+// 「staging deploy (2026-08-20, second run)」與「staging deploy (2026-08-12)」歸為同槽。
+const DATED_BRACKET = new RegExp(String.raw`[（(【[][^）)】\]]*${DATE_PATTERN}[^）)】\]]*[）)】\]]?`, 'g');
+
+// 由帶日期的 key 頭反推它真正描述的「狀態槽」：剝掉帶日期的括號組與裸日期後剩下的語意。
+// 只對帶日期的 key 呼叫（見 doctor），因此不會把 service: a / service: b 這類合法多值鍵誤併。
+export function slotOfDatedKey(keyHead: string): string {
+  return keyHead
+    .replace(DATED_BRACKET, ' ')
+    .replace(new RegExp(DATE_PATTERN, 'g'), ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[，,、\-—:：]+|[，,、\-—:：]+$/g, '')
+    .trim();
+}
+
+// journalEntities 不適用的 entityType（正規化比較）：SessionLog 依設計就是帶時序的流水帳，
+// 由區塊保留上限管控大小，逐塊回報只會淹沒真正的信號。
+const JOURNAL_EXEMPT_TYPES = new Set(['sessionlog']);
+
+// 單一實體內帶日期 key 的數量門檻與佔比門檻，須同時達標。數量濾掉零星標註
+// （在鍵裡順手記個日期）；佔比濾掉「本來就長」的實體——96 條裡有 12 條帶日期屬正常，
+// 34 條裡有 30 條才是日期已成為組織主軸。兩者缺一就會製造警報疲勞，讓真信號被淹沒。
+const JOURNAL_DATED_KEY_THRESHOLD = 5;
+const JOURNAL_DATED_KEY_RATIO = 0.3;
+
+// 未結案標記：出現在 observation 中即代表該事實仍是暫定/待辦，需要在後續 session 回頭收斂。
+// 刻意維持精簡且無歧義——寧可漏報也不要讓一般敘述（如「尚未實作」這類穩定現狀）洗版。
+const UNRESOLVED_MARKERS = ['TODO', 'TBD', '待確認', '待驗證', '待定', '待補', '暫定'];
+const EXCERPT_MAX_CHARS = 120;
 
 // 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
 // 正規化後相同、但原字串不同時，回傳一則提醒（不阻斷寫入）。同批內首次出現的新型別
@@ -635,7 +702,11 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  // 預設為純追加（去重）。entry 帶 upsertKeyed 時，該 entry 中形如 `key: value` 的內容
+  // 改為「同鍵覆蓋」：先刪掉該 entity 上同 key 頭的既有 observation 再追加新值，使一個狀態槽
+  // 永遠只有一條當前值。刻意 opt-in——service: a / service: b 這類合法多值鍵在自動覆蓋下
+  // 會被清空，正確性不能靠猜。無 key 頭的內容不受影響，照常追加。
+  async addObservations(observations: { entityName: string; contents: string[]; upsertKeyed?: boolean | undefined }[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ entityName: string; addedObservations: string[]; replacedObservations?: string[] }[]> {
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {
       const graph = await this.loadGraph(filePath);
@@ -646,10 +717,30 @@ export class KnowledgeGraphManager {
         if (!entity) {
           throw new Error(`Entity with name ${o.entityName} not found`);
         }
-        const existing = new Set(entity.observations);
-        const newObservations = o.contents.filter(content => !existing.has(content));
-        entity.observations.push(...newObservations);
-        return { entityName: o.entityName, addedObservations: newObservations };
+        if (!o.upsertKeyed) {
+          const existing = new Set(entity.observations);
+          const newObservations = o.contents.filter(content => !existing.has(content));
+          entity.observations.push(...newObservations);
+          return { entityName: o.entityName, addedObservations: newObservations };
+        }
+        // 本 entry 的所有 key 頭先收齊，再一次過濾，讓同批寫入互不干擾。
+        const incomingKeys = new Set<string>();
+        for (const content of o.contents) {
+          const head = keyHeadOf(content);
+          if (head !== undefined) incomingKeys.add(head);
+        }
+        const incoming = new Set(o.contents);
+        const replacedObservations = entity.observations.filter(existing => {
+          const head = keyHeadOf(existing);
+          // 逐字相同者不算「被取代」——它就是要寫的那條，留著即可（回報 0 新增 0 取代）。
+          return head !== undefined && incomingKeys.has(head) && !incoming.has(existing);
+        });
+        const replaced = new Set(replacedObservations);
+        const kept = entity.observations.filter(existing => !replaced.has(existing));
+        const stillPresent = new Set(kept);
+        const newObservations = o.contents.filter(content => !stillPresent.has(content));
+        entity.observations = [...kept, ...newObservations];
+        return { entityName: o.entityName, addedObservations: newObservations, replacedObservations };
       });
       await this.saveGraph(graph, filePath);
       return results;
@@ -1083,26 +1174,88 @@ export class KnowledgeGraphManager {
       .map(([normalized, set]) => ({ normalized, types: [...set].sort((a, b) => a.localeCompare(b)) }))
       .sort((a, b) => a.normalized.localeCompare(b.normalized));
 
-    // duplicateCandidates：同一 entity 內共用相同 ':' key 前綴的多條 observations。
+    // duplicateCandidates：同一 entity 內共用相同 key 前綴的多條 observations。
+    // journalEntities：帶日期的 key 頭另按「剝掉日期後的狀態槽」分組，並統計每個實體的
+    // 帶日期鍵總數——日期入鍵者結構上不可被覆蓋，累積到一定量即代表該實體已淪為流水帳。
     const duplicateCandidates: DoctorReport['duplicateCandidates'] = [];
+    const journalEntities: DoctorReport['journalEntities'] = [];
     for (const e of graph.entities) {
       const groups = new Map<string, string[]>();
+      const slots = new Map<string, { keys: Set<string>; count: number }>();
+      // SessionLog 對兩種偵測都豁免。duplicateCandidates 在它身上是結構性假陽性：
+      // `session <ts>｜…` 的首個 ':' 落在 ISO 時間戳裡，同一小時的區塊因而歸為同鍵，
+      // 而它們是相異的工作紀錄不是同一事實的版本；照報還會把整批長文吐進報告淹掉真信號。
+      const journalExempt = JOURNAL_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType));
+      let datedKeys = 0;
       for (const o of e.observations) {
-        const idx = o.indexOf(':');
-        if (idx <= 0) continue; // 無 key 前綴（無 ':' 或以 ':' 開頭）則略過。
-        const prefix = o.slice(0, idx).trim();
-        if (prefix === '') continue;
+        const prefix = keyHeadOf(o);
+        if (prefix === undefined) continue; // 無鍵 observation 不參與任何分組。
+        if (journalExempt) continue;
         const arr = groups.get(prefix);
         if (arr) arr.push(o);
         else groups.set(prefix, [o]);
+        if (!DATE_IN_KEY.test(prefix)) continue;
+        datedKeys += 1;
+        const slot = slotOfDatedKey(prefix);
+        const bucket = slots.get(slot);
+        if (bucket) {
+          bucket.keys.add(prefix);
+          bucket.count += 1;
+        } else {
+          slots.set(slot, { keys: new Set([prefix]), count: 1 });
+        }
       }
       for (const [keyPrefix, obs] of groups) {
         if (obs.length >= 2) {
           duplicateCandidates.push({ entityName: e.name, keyPrefix, count: obs.length, observations: obs });
         }
       }
+      // 同槽需至少兩個相異鍵；同一個鍵重複多次屬 duplicateCandidates 的範疇，兩者不重複回報。
+      const sameSlotGroups = [...slots.entries()]
+        .filter(([, { keys }]) => keys.size >= 2)
+        .map(([slot, { keys, count }]) => ({
+          slot,
+          count,
+          keyPrefixes: [...keys].sort((a, b) => a.localeCompare(b)),
+        }))
+        .sort((a, b) => b.count - a.count || a.slot.localeCompare(b.slot));
+      // 同槽重複是精確證據，不受數量/佔比門檻約束，一律回報。
+      const drifted =
+        datedKeys >= JOURNAL_DATED_KEY_THRESHOLD &&
+        datedKeys >= e.observations.length * JOURNAL_DATED_KEY_RATIO;
+      if (drifted || sameSlotGroups.length > 0) {
+        journalEntities.push({
+          entityName: e.name,
+          datedKeys,
+          totalObservations: e.observations.length,
+          sameSlotGroups,
+        });
+      }
     }
     duplicateCandidates.sort((a, b) => a.entityName.localeCompare(b.entityName) || a.keyPrefix.localeCompare(b.keyPrefix));
+    journalEntities.sort((a, b) => b.datedKeys - a.datedKeys || a.entityName.localeCompare(b.entityName));
+
+    // unresolvedMarkers：仍帶未結案標記的 observation，依 entity 匯總。
+    const unresolvedMarkers: DoctorReport['unresolvedMarkers'] = [];
+    for (const e of graph.entities) {
+      const markers = new Set<string>();
+      const excerpts: string[] = [];
+      for (const o of e.observations) {
+        const hit = UNRESOLVED_MARKERS.filter(m => o.includes(m));
+        if (hit.length === 0) continue;
+        for (const m of hit) markers.add(m);
+        excerpts.push(o.length > EXCERPT_MAX_CHARS ? `${o.slice(0, EXCERPT_MAX_CHARS)}…` : o);
+      }
+      if (excerpts.length > 0) {
+        unresolvedMarkers.push({
+          entityName: e.name,
+          count: excerpts.length,
+          markers: [...markers].sort((a, b) => a.localeCompare(b)),
+          excerpts,
+        });
+      }
+    }
+    unresolvedMarkers.sort((a, b) => b.count - a.count || a.entityName.localeCompare(b.entityName));
 
     // oversizedEntities：observation 條數或字元總量達閾值的實體（提示拆分/prune 的策展信號）。
     // 依 totalChars 遞減排序（最重的 hub 在前），同量以名稱穩定排序。
@@ -1132,6 +1285,8 @@ export class KnowledgeGraphManager {
       typeCollisions,
       duplicateCandidates,
       oversizedEntities,
+      journalEntities,
+      unresolvedMarkers,
       stats: {
         database: context || 'default',
         entityCount: graph.entities.length,

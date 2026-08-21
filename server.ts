@@ -216,7 +216,7 @@ async function dispatchTool(request: CallToolRequest) {
     case "aim_memory_link":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createRelations(args.relations as Relation[], context, location, projectRoot, args.allowDangling as boolean | undefined), null, 2) }] };
     case "aim_memory_add_facts":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[], context, location, projectRoot), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[]; upsertKeyed?: boolean }[], context, location, projectRoot), null, 2) }] };
     case "aim_memory_forget":
       await knowledgeGraphManager.deleteEntities(args.entityNames as string[], context, location, projectRoot);
       return { content: [{ type: "text", text: "Entities deleted successfully" }] };
