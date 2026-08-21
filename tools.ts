@@ -142,9 +142,13 @@ RETURNS: Array of {entityName, addedObservations} showing what was added (duplic
 
 APPEND VS UPSERT: By default this appends, so writing a newer version of a fact leaves the old one in place and both are recalled forever. Set upsertKeyed:true on an entry to make its 'key: value' contents overwrite the same key on that entity instead - use it for single-valued state slots (deploy procedure, current version, chosen approach) so a slot always holds exactly one current line.
 
-WRITE STATE, NOT A JOURNAL: keep the date inside the value, never in the key. "deploy (2026-08-12): ..." creates a brand-new key on every write, so nothing can ever supersede it and the graph grows stale entries that no tool can find. Write "deploy procedure: ...; last_verified: 2026-08-12" with upsertKeyed instead. Genuinely multi-valued keys (several "service: ..." lines) must stay append-only - do not set upsertKeyed for those, it would delete the siblings.
+WRITE STATE, NOT A JOURNAL: the date goes inside the value, never in the key. "deploy (2026-08-12): ..." mints a new key on every write, so nothing can supersede it and no tool can find the pile-up. Write "deploy procedure: ...; last_verified: 2026-08-12" with upsertKeyed instead. A momentary observation ("checked today, all healthy") has no value once the day passes - anyone who needs it will look at the live system - so it belongs in the session log, which is pruned, not on a domain entity, which is not. Genuinely multi-valued keys (several "service: ..." lines) stay append-only: upsertKeyed there would delete the siblings.
 
-FRESHNESS STAMP: when a value was checked against reality, record it as exactly "; last_verified: <ISO date>" at the end of the value. One spelling only - a parenthetical "(verified ...)" or "(checked ...)" cannot be matched later, so it is the same as no stamp at all.
+FRESHNESS STAMP: exactly "; last_verified: <ISO date>" at the end of the value. One spelling only - a parenthetical "(verified ...)" cannot be matched later, so it is the same as no stamp.
+
+SLOT NAMES: reuse these key heads rather than inventing a synonym, so the same fact lands in the same slot and is overwritten instead of duplicated - "deploy procedure:", "deployed images:", "host:", "port:", "namespace:", "registry:", "current version:", "chosen approach:", "owner:", "known pitfall:" (that last one is multi-valued, append-only, never dated).
+
+DO NOT COPY WHAT THE REPO DEFINES: commands, chart or image versions, paths and config layout live in the codebase (AGENTS.md, Makefile, chart and values files) and change without anybody updating this graph, so a copy here goes stale silently and is recalled as current. Store a pointer instead - "deploy SSoT: <file> <section>; last_verified: <date>". A recorded state of a remote system (deployed, running, healthy) is a lead to confirm, never a fact.
 
 DATABASE: Adds to entities in the specified 'context' database, or master database if not specified.
 
@@ -585,10 +589,10 @@ RETURNS an object with:
 - orphans: entity names with no relation at all
 - danglingRelations: relations whose 'from'/'to' endpoint entity does not exist
 - typeCollisions: groups of entityTypes that differ only by case/underscore/hyphen (e.g. dev_plan vs dev-plan vs DevPlan)
-- duplicateCandidates: within one entity, multiple observations sharing the same key prefix (possible stale versions), shaped {entityName, keyPrefix, count, excerpts} where count is exact and excerpts sample at most 3 members, each truncated to 120 chars. Both ':' and the full-width '：' count as the separator. A legitimately multi-valued key (several "service: ..." lines) is indistinguishable from stale versions and is reported too, so judge each group before acting; read the full bodies with get({names, observationPrefix}) when the excerpt is not enough
-- journalEntities: entities drifting from a state store into a work journal. A key head with a date in it ("deploy (2026-08-12): ...") is a brand-new key on every write, so no later fact can ever supersede it and nothing detects the pile-up. An entity is listed when it has 5+ such dated keys, or when two of its keys collapse to the same slot once the date is stripped ("deploy (2026-08-12)" and "deploy (2026-08-20)") - the latter is a same-fact duplicate that duplicateCandidates cannot see, because every key is unique. Each item is {entityName, datedKeys, totalObservations, sameSlotGroups:[{slot, count, keyPrefixes}]}. To fix: keep the current value as one dateless state slot written with add_facts.upsertKeyed (date inside the value), and prune the superseded snapshots by feeding each keyPrefix to remove_facts.observationPrefix, or move them to the session log if the history is worth keeping. SessionLog entities are exempt because they are journals by design
-- unresolvedMarkers: observations still carrying TODO / TBD / 待確認 / 待驗證 / 待定 / 待補 / 暫定. These are facts recorded while something was undecided; once decided, nobody goes back to update them, so they age silently. Each item is {entityName, count, markers, excerpts} where count is exact and excerpts sample at most 3, each truncated to 120 chars. Re-check each: settled -> overwrite the slot with upsertKeyed; still open -> leave it; obsolete -> remove_facts
-- SessionLog entities are exempt from all three of duplicateCandidates, journalEntities, and unresolvedMarkers: a session log is a journal whose pending blocks are meant to list open items, so all three would fire on it every time, and a signal that always fires is not a signal. Its size is governed by the block-retention cap instead
+- duplicateCandidates: within one entity, observations sharing a key prefix (possible stale versions), as {entityName, keyPrefix, count, excerpts} - count exact, excerpts sample at most 3 at 120 chars each. ':' and full-width '：' both separate. A legitimately multi-valued key (several "service: ..." lines) looks identical and is reported too, so judge a group before acting; use get({names, observationPrefix}) for full bodies
+- journalEntities: entities drifting from a state store into a work journal, as {entityName, datedKeys, totalObservations, sameSlotGroups:[{slot, count, keyPrefixes}]}. A dated key head is new on every write, so nothing supersedes it and nothing detects the pile-up. Listed on 5+ dated keys, or when two keys collapse to one slot after stripping the date - that pair is a same-fact duplicate duplicateCandidates cannot see, because every key is unique. Fix: keep the current value as one dateless slot via add_facts.upsertKeyed, then prune each superseded keyPrefix via remove_facts.observationPrefix, or move it to the session log if the history matters
+- unresolvedMarkers: observations still carrying TODO / TBD / 待確認 / 待驗證 / 待定 / 待補 / 暫定, as {entityName, count, markers, excerpts} (same sampling). These were recorded while something was undecided, and nobody returns to update them once it is settled. Re-check each: settled -> upsertKeyed the slot; still open -> leave it; obsolete -> remove_facts
+- SessionLog entities are exempt from those three checks: a session log is a journal whose pending blocks are meant to list open items, so all three would fire every time, and a signal that always fires is not a signal. The block-retention cap governs its size instead
 - oversizedEntities: entities whose observation count (>=50) or total observation characters (>=10,000) reach curation thresholds, sorted by totalChars descending. Advisory only: such hub entities eat a large share of the output budget whenever search/get matches them - split them into smaller entities or prune stale observations
 - stats: entity/relation/observation counts and per-entityType distribution for the audited database
 
@@ -638,17 +642,34 @@ EXAMPLES:
 // 否則模型會照著描述送出被拒絕的 global 呼叫。因此在此模式下：
 //   1. 將 projectRoot 標記為每個工具必填（提示層；實際強制在 storage.ts）。
 //   2. 移除 location 屬性 —— global 被停用、project 在有 projectRoot 時多餘。
-//   3. 於描述最前面加註，讓模型忽略下方任何 global/location 範例。
+//   3. 刪掉描述中所有 global/location 的說明與範例，因為那些功能在此模式下不存在。
+//   4. projectRoot 的描述換成精簡版，並於描述最前面加簡短公告。
+//
+// ⚠️ 這裡的字元數是**每個 session 的固定成本**：工具清單隨每次連線送進模型 context，
+// 15 個工具共用的片段每省 1 字元就省 15 字元。原始版本有約 9,400 字元屬機械性重複
+// （projectRoot 描述 349×15、公告 217×15、以及 6 行已停用功能的範例），
+// 遠大於一個專案記憶本身的召回量，故在此一次性壓縮。行為性指引不在削減範圍。
 if (workspaceOnly) {
-  const note =
-    "[workspace-only mode] Always pass projectRoot set to the current workspace's absolute root path. " +
-    "Global storage and the 'location' parameter are disabled in this mode; ignore any 'global'/'location' examples below.\n\n";
+  const note = "[workspace-only mode] Pass projectRoot = the current workspace's absolute root path on every call.\n\n";
+  const conciseProjectRoot = {
+    type: "string",
+    description: "Absolute path to the current workspace root; memory lives in <projectRoot>/.aim/. Required.",
+  };
+  // 已停用功能的殘留文字：location 段落、以及提及 global/project location 的範例行。
+  const deadLine = /^(LOCATION OVERRIDE:|- (?:Master|Work|Personal|Global)[^\n]*\bin (?:global|project) location:)/;
   for (const tool of TOOL_DEFINITIONS) {
     const schema = tool.inputSchema as { required?: string[]; properties?: Record<string, unknown> };
     schema.required = Array.from(new Set([...(schema.required ?? []), "projectRoot"]));
     if (schema.properties) {
       delete schema.properties.location;
+      if (schema.properties.projectRoot) schema.properties.projectRoot = conciseProjectRoot;
     }
-    tool.description = note + (tool.description ?? "");
+    const body = (tool.description ?? "")
+      .split("\n")
+      .filter(line => !deadLine.test(line.trim()))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    tool.description = note + body;
   }
 }
