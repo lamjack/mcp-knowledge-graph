@@ -238,8 +238,10 @@ export interface DoctorReport {
   danglingRelations: Relation[];
   // entityType 僅差大小寫/底線/連字符的分組（正規化鍵 -> 原始型別集合）。
   typeCollisions: { normalized: string; types: string[] }[];
-  // 同一 entity 內共用相同 ':' key 前綴的多條 observations（可能是未清理的過時版本）。
-  duplicateCandidates: { entityName: string; keyPrefix: string; count: number; observations: string[] }[];
+  // 同一 entity 內共用相同 key 前綴的多條 observations（可能是未清理的過時版本）。
+  // excerpts 截斷至 EXCERPT_MAX_CHARS：合法多值鍵（`service:` × N）與過時版本在此無法區分，
+  // 一律回報但**不逐字回吐**——實測某真實圖譜的 runbook 多值鍵曾讓本區段吃掉單次輸出預算近三成。
+  duplicateCandidates: { entityName: string; keyPrefix: string; count: number; excerpts: string[] }[];
   // 超大實體警告（advisory）：observation 條數或字元總量達到閾值的實體，依 totalChars 遞減排序。
   // 超大 hub 實體被 search/get 命中時單次即回傳大量字元，稀釋 context——提示拆分或 prune。
   oversizedEntities: {
@@ -402,9 +404,11 @@ export function slotOfDatedKey(keyHead: string): string {
     .trim();
 }
 
-// journalEntities 不適用的 entityType（正規化比較）：SessionLog 依設計就是帶時序的流水帳，
-// 由區塊保留上限管控大小，逐塊回報只會淹沒真正的信號。
-const JOURNAL_EXEMPT_TYPES = new Set(['sessionlog']);
+// 三種陳舊/重複偵測（duplicateCandidates / journalEntities / unresolvedMarkers）皆不適用的
+// entityType（正規化比較）。SessionLog 依設計就是帶時序的流水帳且 pending 區塊本來就在列
+// 未決事項，三者對它都是必然命中；必然命中的信號不是信號，只會淹沒真正的問題。
+// 它的體積與收斂由區塊保留上限（與 prune 時的 pending 處理）負責，不由本審計負責。
+const AUDIT_EXEMPT_TYPES = new Set(['sessionlog']);
 
 // 單一實體內帶日期 key 的數量門檻與佔比門檻，須同時達標。數量濾掉零星標註
 // （在鍵裡順手記個日期）；佔比濾掉「本來就長」的實體——96 條裡有 12 條帶日期屬正常，
@@ -416,6 +420,21 @@ const JOURNAL_DATED_KEY_RATIO = 0.3;
 // 刻意維持精簡且無歧義——寧可漏報也不要讓一般敘述（如「尚未實作」這類穩定現狀）洗版。
 const UNRESOLVED_MARKERS = ['TODO', 'TBD', '待確認', '待驗證', '待定', '待補', '暫定'];
 const EXCERPT_MAX_CHARS = 120;
+// 每組最多取樣幾條摘錄。判斷「這組是合法多值還是同事實的多版本」三條足矣，
+// 而 `count` 已如實回報組員總數；9 條全吐只是把預算花在重複資訊上。
+const EXCERPT_SAMPLE_LIMIT = 3;
+
+// 報告用摘錄：超長 observation 截斷並標記，避免審計區段吃掉單次輸出預算。
+function excerptOf(observation: string): string {
+  return observation.length > EXCERPT_MAX_CHARS
+    ? `${observation.slice(0, EXCERPT_MAX_CHARS)}…`
+    : observation;
+}
+
+// 取樣並截斷一組 observation，供審計報告使用（順序保留，取前 N 條）。
+function excerptsOf(observations: string[]): string[] {
+  return observations.slice(0, EXCERPT_SAMPLE_LIMIT).map(excerptOf);
+}
 
 // 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
 // 正規化後相同、但原字串不同時，回傳一則提醒（不阻斷寫入）。同批內首次出現的新型別
@@ -667,6 +686,22 @@ export class KnowledgeGraphManager {
       const newEntities = entities.filter(e => !existingNames.has(e.name));
       // 只對「真正新建立」的實體比對既有型別，避免對被去重忽略的重複實體誤報。
       const warnings = detectEntityTypeWarnings(graph.entities.map(e => e.entityType), newEntities);
+      // 實體已存在時本方法從不覆蓋，其 observations 會被整批丟棄。過去這是**靜默**的：
+      // 回傳空陣列，呼叫端看起來像成功寫入，事實卻從未落地——舊事實因而繼續被當成現況召回。
+      // 這裡如實回報丟棄量並指向真正該用的工具（與 remove_facts / replace_fact 的無靜默失敗一致）。
+      for (const e of entities) {
+        if (existingNames.has(e.name) && e.observations.length > 0) {
+          warnings.push(
+            `Entity "${e.name}" already exists: ${e.observations.length} observation(s) were NOT written. ` +
+            `aim_memory_store never overwrites - use aim_memory_add_facts to append, ` +
+            `or add_facts with upsertKeyed / aim_memory_replace_fact to supersede a keyed fact.`,
+          );
+        }
+      }
+      if (newEntities.length === 0) {
+        // 沒有真正新增就不寫檔（比照 replaceFact / removeFacts 的 0 命中不觸碰 mtime）。
+        return { entities: newEntities, warnings };
+      }
       graph.entities.push(...newEntities);
       await this.saveGraph(graph, filePath);
       return { entities: newEntities, warnings };
@@ -1185,12 +1220,12 @@ export class KnowledgeGraphManager {
       // SessionLog 對兩種偵測都豁免。duplicateCandidates 在它身上是結構性假陽性：
       // `session <ts>｜…` 的首個 ':' 落在 ISO 時間戳裡，同一小時的區塊因而歸為同鍵，
       // 而它們是相異的工作紀錄不是同一事實的版本；照報還會把整批長文吐進報告淹掉真信號。
-      const journalExempt = JOURNAL_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType));
+      const auditExempt = AUDIT_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType));
       let datedKeys = 0;
       for (const o of e.observations) {
         const prefix = keyHeadOf(o);
         if (prefix === undefined) continue; // 無鍵 observation 不參與任何分組。
-        if (journalExempt) continue;
+        if (auditExempt) continue;
         const arr = groups.get(prefix);
         if (arr) arr.push(o);
         else groups.set(prefix, [o]);
@@ -1207,7 +1242,7 @@ export class KnowledgeGraphManager {
       }
       for (const [keyPrefix, obs] of groups) {
         if (obs.length >= 2) {
-          duplicateCandidates.push({ entityName: e.name, keyPrefix, count: obs.length, observations: obs });
+          duplicateCandidates.push({ entityName: e.name, keyPrefix, count: obs.length, excerpts: excerptsOf(obs) });
         }
       }
       // 同槽需至少兩個相異鍵；同一個鍵重複多次屬 duplicateCandidates 的範疇，兩者不重複回報。
@@ -1236,22 +1271,25 @@ export class KnowledgeGraphManager {
     journalEntities.sort((a, b) => b.datedKeys - a.datedKeys || a.entityName.localeCompare(b.entityName));
 
     // unresolvedMarkers：仍帶未結案標記的 observation，依 entity 匯總。
+    // SessionLog 同樣豁免：`pending:` 區塊本來就在列未決事項，每個 session 必然命中——
+    // 必然命中的信號不是信號。它的收斂由區塊保留上限與 prune 時的 pending 處理負責。
     const unresolvedMarkers: DoctorReport['unresolvedMarkers'] = [];
     for (const e of graph.entities) {
+      if (AUDIT_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType))) continue;
       const markers = new Set<string>();
-      const excerpts: string[] = [];
+      const hits: string[] = [];
       for (const o of e.observations) {
-        const hit = UNRESOLVED_MARKERS.filter(m => o.includes(m));
-        if (hit.length === 0) continue;
-        for (const m of hit) markers.add(m);
-        excerpts.push(o.length > EXCERPT_MAX_CHARS ? `${o.slice(0, EXCERPT_MAX_CHARS)}…` : o);
+        const matched = UNRESOLVED_MARKERS.filter(m => o.includes(m));
+        if (matched.length === 0) continue;
+        for (const m of matched) markers.add(m);
+        hits.push(o);
       }
-      if (excerpts.length > 0) {
+      if (hits.length > 0) {
         unresolvedMarkers.push({
           entityName: e.name,
-          count: excerpts.length,
+          count: hits.length,
           markers: [...markers].sort((a, b) => a.localeCompare(b)),
-          excerpts,
+          excerpts: excerptsOf(hits),
         });
       }
     }

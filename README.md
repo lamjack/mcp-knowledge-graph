@@ -163,7 +163,7 @@ my-project/
 
 ## 可用工具
 
-- `aim_memory_store` — 儲存新記憶（人物、專案、概念）。若新 `entityType` 與既有型別僅差大小寫/底線/連字符，回傳會附 `warnings`（不阻斷寫入）
+- `aim_memory_store` — 儲存新記憶（人物、專案、概念）。**從不覆蓋**：名稱已存在的實體會被跳過、其 observations 整批丟棄——此時回傳 `warnings` 指名該實體與丟棄條數並指向 `add_facts`（過去這是靜默的，看起來像寫入成功但事實從未落地）。若新 `entityType` 與既有型別僅差大小寫/底線/連字符也會附 `warnings`（皆不阻斷寫入）
 - `aim_memory_add_facts` — 向既有記憶新增事實。預設純追加；entry 帶 `upsertKeyed:true` 時，其中形如 `key: value` 的內容改為「同鍵覆蓋」（半形 `:` 與全形 `：` 皆視為分隔符），讓單值狀態槽永遠只有一條當前值，回傳另附 `replacedObservations`。**刻意 opt-in**：合法多值鍵（多條 `service: ...`）若誤開會被清空
 - `aim_memory_link` — 連結兩個記憶。**預設對不存在的端點報錯**（防幽靈節點）；傳 `allowDangling:true` 可還原舊的寬鬆行為
 - `aim_memory_search` — 依關鍵字搜尋記憶
@@ -178,7 +178,9 @@ my-project/
 
 - `aim_memory_update_entity` — **原地**更新實體：改名與/或改 `entityType`，保留 observations（順序不變）。改名會連帶重寫所有 relation 的 `from`/`to` 端點；改名撞到既有名稱則報錯不覆蓋。避免「forget → store → 重新 link」的轉錄風險。參數：`name`（必填）、`newName?`、`entityType?`（後兩者至少給一個）
 - `aim_memory_replace_fact` — 原子「刪舊補新」：刪除某實體所有命中（`matchPrefix` 或 `matchSubstring` 二擇一）的 observation，並在**同一次寫入**追加 `newText`。回傳 `{matched, replaced}`；0 命中時不追加並回傳 `{matched:0, replaced:false}`（不靜默 no-op）。適合取代 key 型 observation（如「開發計畫編號: ...」）。參數：`entityName`、`newText`（必填）、`matchPrefix?`/`matchSubstring?`（恰一）
-- `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 key 前綴的多條 observation；半形 `:` 與全形 `：` 皆為分隔符）、`journalEntities`（**流水帳漂移**：key 頭內嵌日期者每寫一次就生成新鍵，結構上永遠無法被覆蓋。帶日期鍵達 5 條**且**佔該實體 30% 以上，或有多個鍵剝掉日期後指向同一狀態槽時列出，附 `{datedKeys, totalObservations, sameSlotGroups}`；`SessionLog` 型別豁免）、`unresolvedMarkers`（**未結案標記**：仍帶 `TODO`/`TBD`/`待確認`/`待驗證`/`待定`/`待補`/`暫定` 的 observation，附 120 字元截斷的 `excerpts`——定案後沒人回頭改的事實會無限期陳舊）、`oversizedEntities`（**超大實體警告**：observation 條數 ≥ 50 或字元總量 ≥ 10,000 的實體，依 `totalChars` 遞減排序，附 `exceeds` 原因——超大 hub 被 search/get 命中一次就回傳大量字元稀釋 context，提示拆分或 prune；僅警告不阻斷）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
+- `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 key 前綴的多條 observation；半形 `:` 與全形 `：` 皆為分隔符；`count` 精確、`excerpts` 每組取樣 ≤ 3 條各截斷 120 字元——合法多值鍵如多條 `service: ...` 與過時版本無法區分，一律回報但不逐字回吐，需全文時用 `get({names, observationPrefix})`）、`journalEntities`（**流水帳漂移**：key 頭內嵌日期者每寫一次就生成新鍵，結構上永遠無法被覆蓋。帶日期鍵達 5 條**且**佔該實體 30% 以上，或有多個鍵剝掉日期後指向同一狀態槽時列出，附 `{datedKeys, totalObservations, sameSlotGroups}`；`SessionLog` 型別豁免）、`unresolvedMarkers`（**未結案標記**：仍帶 `TODO`/`TBD`/`待確認`/`待驗證`/`待定`/`待補`/`暫定` 的 observation，附 120 字元截斷的 `excerpts`——定案後沒人回頭改的事實會無限期陳舊）、`oversizedEntities`
+
+  `SessionLog` 型別對 `duplicateCandidates` / `journalEntities` / `unresolvedMarkers` **三者皆豁免**：它依設計就是流水帳、`pending` 區塊本來就在列未決事項，三者對它都必然命中，而必然命中的信號不是信號；其體積由區塊保留上限管控。（**超大實體警告**：observation 條數 ≥ 50 或字元總量 ≥ 10,000 的實體，依 `totalChars` 遞減排序，附 `exceeds` 原因——超大 hub 被 search/get 命中一次就回傳大量字元稀釋 context，提示拆分或 prune；僅警告不阻斷）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
 - `aim_memory_list_entity_types` — 唯讀，回傳各 `entityType` 與其實體計數（數量多者在前），供型別詞彙治理
 - `aim_memory_count_observations` — 唯讀 observation 計數（**不回本文**）：對指定 entities 回傳 `{entityName, entityExists, totalObservations, matched, groups?}`；`observationPrefix` 必填，加 `groupByDelimiter`（如 `｜`）可把命中條目按「開頭到首個分隔符」分組回傳 `[{key, count}]`。回答「entity 內某前綴有幾個分組、各自 key 是什麼」不需全量拉取，是 SessionLog prune 的決策與刪後核實工具
 

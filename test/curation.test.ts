@@ -441,6 +441,77 @@ test('doctor detects duplicate-candidate observations sharing a key prefix', asy
   assert.equal(report.duplicateCandidates[0]!.count, 2);
 });
 
+test('doctor truncates duplicate-candidate excerpts instead of echoing whole observations', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      {
+        // A legitimately multi-valued key is reported too, because nothing can tell it
+        // apart from stale versions. Echoing every body in full is what made the section
+        // cost a third of the response budget on a real graph.
+        name: 'Runbook',
+        entityType: 'Runbook',
+        observations: [`known_pitfall: ${'a'.repeat(600)}`, `known_pitfall: ${'b'.repeat(600)}`],
+      },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  const hit = report.duplicateCandidates[0]!;
+  assert.equal(hit.count, 2);
+  assert.equal(hit.excerpts.length, 2);
+  for (const excerpt of hit.excerpts) {
+    assert.ok(excerpt.length <= 121, `excerpt stays bounded, got ${excerpt.length}`);
+    assert.ok(excerpt.endsWith('…'), 'truncation is visible');
+  }
+});
+
+test('doctor samples at most three excerpts per group while count stays exact', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      {
+        name: 'Runbook',
+        entityType: 'Runbook',
+        observations: Array.from({ length: 9 }, (_, i) => `service: number ${i}`),
+      },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  const hit = report.duplicateCandidates[0]!;
+  assert.equal(hit.count, 9, 'the group size stays exact');
+  assert.equal(hit.excerpts.length, 3, 'three samples are enough to judge the group');
+  assert.deepEqual(hit.excerpts, ['service: number 0', 'service: number 1', 'service: number 2']);
+});
+
+test('doctor exempts SessionLog entities from unresolvedMarkers', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      {
+        name: 'Work log',
+        entityType: 'SessionLog',
+        // A pending block is supposed to list open items, so this would fire on every
+        // session forever, and a signal that always fires is not a signal.
+        observations: ['session 2026-08-21T09:00:00+08:00｜pending: 待確認 whether X, plus a TODO'],
+      },
+    ],
+    undefined,
+    undefined,
+    root,
+  );
+  const report = await mgr.doctor(undefined, undefined, root);
+  assert.deepEqual(report.unresolvedMarkers, [], 'the block-retention cap governs a session log');
+});
+
 test('doctor flags entities at or above the observation-count threshold (50)', async () => {
   const root = tmpRoot();
   const mgr = new KnowledgeGraphManager();
@@ -972,6 +1043,52 @@ test('createEntities returns a warning when a new entityType only differs in for
   assert.equal(res.warnings.length, 1);
   assert.match(res.warnings[0]!, /DevPlan/);
   assert.match(res.warnings[0]!, /dev-plan/);
+});
+
+test('createEntities warns when an existing entity silently swallows its observations', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [{ name: 'Env', entityType: 'Environment', observations: ['deploy: original'] }],
+    undefined,
+    undefined,
+    root,
+  );
+  const res = await mgr.createEntities(
+    [{ name: 'Env', entityType: 'Environment', observations: ['deploy: newer', 'owner: alice'] }],
+    undefined,
+    undefined,
+    root,
+  );
+  assert.deepEqual(res.entities, [], 'an existing entity is never recreated');
+  assert.equal(res.warnings.length, 1, 'the dropped write must not be silent');
+  assert.match(res.warnings[0]!, /Env/);
+  assert.match(res.warnings[0]!, /2/, 'says how many observations were discarded');
+  assert.match(res.warnings[0]!, /add_facts/, 'points at the tool that would have worked');
+  const g = await mgr.readGraph(undefined, undefined, root);
+  assert.deepEqual(
+    g.entities[0]!.observations,
+    ['deploy: original'],
+    'behaviour is unchanged: store still never overwrites',
+  );
+});
+
+test('createEntities does not warn when an existing entity carries no new observations', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [{ name: 'Env', entityType: 'Environment', observations: ['deploy: original'] }],
+    undefined,
+    undefined,
+    root,
+  );
+  const res = await mgr.createEntities(
+    [{ name: 'Env', entityType: 'Environment', observations: [] }],
+    undefined,
+    undefined,
+    root,
+  );
+  assert.deepEqual(res.warnings, [], 'an idempotent re-declaration loses nothing');
 });
 
 test('createEntities emits no warning for a genuinely new entityType', async () => {

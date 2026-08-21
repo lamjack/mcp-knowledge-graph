@@ -46,7 +46,9 @@ STORAGE LOCATIONS: Files are stored as JSONL (e.g., memory.jsonl, memory-work.js
 - Global: User's configured --memory-path directory
 - Use 'location' parameter to override: 'project' or 'global'
 
-RETURNS: Array of created entities.
+RETURNS: Array of created entities, or {entities, warnings} when there is anything to warn about.
+
+⚠️ NEVER OVERWRITES: an entity whose name already exists is skipped and its observations are discarded. That is not an error, but it is reported as a warning naming the entity and how many observations were dropped, so a "write" that never landed cannot pass for success. To change an existing entity use aim_memory_add_facts (append), add_facts with upsertKeyed (replace one keyed state slot), or aim_memory_replace_fact.
 
 EXAMPLES:
 - Master database (default): aim_memory_store({entities: [{name: "John", entityType: "person", observations: ["Met at conference"]}]})
@@ -140,13 +142,15 @@ RETURNS: Array of {entityName, addedObservations} showing what was added (duplic
 
 APPEND VS UPSERT: By default this appends, so writing a newer version of a fact leaves the old one in place and both are recalled forever. Set upsertKeyed:true on an entry to make its 'key: value' contents overwrite the same key on that entity instead - use it for single-valued state slots (deploy procedure, current version, chosen approach) so a slot always holds exactly one current line.
 
-WRITE STATE, NOT A JOURNAL: keep the date inside the value, never in the key. "deploy (2026-08-12): ..." creates a brand-new key on every write, so nothing can ever supersede it and the graph grows stale entries that no tool can find. Write "deploy procedure: ... (verified 2026-08-12)" with upsertKeyed instead. Genuinely multi-valued keys (several "service: ..." lines) must stay append-only - do not set upsertKeyed for those, it would delete the siblings.
+WRITE STATE, NOT A JOURNAL: keep the date inside the value, never in the key. "deploy (2026-08-12): ..." creates a brand-new key on every write, so nothing can ever supersede it and the graph grows stale entries that no tool can find. Write "deploy procedure: ...; last_verified: 2026-08-12" with upsertKeyed instead. Genuinely multi-valued keys (several "service: ..." lines) must stay append-only - do not set upsertKeyed for those, it would delete the siblings.
+
+FRESHNESS STAMP: when a value was checked against reality, record it as exactly "; last_verified: <ISO date>" at the end of the value. One spelling only - a parenthetical "(verified ...)" or "(checked ...)" cannot be matched later, so it is the same as no stamp at all.
 
 DATABASE: Adds to entities in the specified 'context' database, or master database if not specified.
 
 EXAMPLES:
 - aim_memory_add_facts({observations: [{entityName: "John", contents: ["Lives in Seattle", "Works in tech"]}]})
-- Upsert a state slot: aim_memory_add_facts({observations: [{entityName: "Staging", contents: ["deploy procedure: pull then recreate (verified 2026-08-20)"], upsertKeyed: true}]})
+- Upsert a state slot: aim_memory_add_facts({observations: [{entityName: "Staging", contents: ["deploy procedure: pull then recreate; last_verified: 2026-08-20"], upsertKeyed: true}]})
 - aim_memory_add_facts({context: "work", observations: [{entityName: "Q4_Project", contents: ["Behind schedule", "Need more resources"]}]})`,
     inputSchema: {
       type: "object",
@@ -581,9 +585,10 @@ RETURNS an object with:
 - orphans: entity names with no relation at all
 - danglingRelations: relations whose 'from'/'to' endpoint entity does not exist
 - typeCollisions: groups of entityTypes that differ only by case/underscore/hyphen (e.g. dev_plan vs dev-plan vs DevPlan)
-- duplicateCandidates: within one entity, multiple observations sharing the same key prefix (possible stale versions). Both ':' and the full-width '：' count as the separator
+- duplicateCandidates: within one entity, multiple observations sharing the same key prefix (possible stale versions), shaped {entityName, keyPrefix, count, excerpts} where count is exact and excerpts sample at most 3 members, each truncated to 120 chars. Both ':' and the full-width '：' count as the separator. A legitimately multi-valued key (several "service: ..." lines) is indistinguishable from stale versions and is reported too, so judge each group before acting; read the full bodies with get({names, observationPrefix}) when the excerpt is not enough
 - journalEntities: entities drifting from a state store into a work journal. A key head with a date in it ("deploy (2026-08-12): ...") is a brand-new key on every write, so no later fact can ever supersede it and nothing detects the pile-up. An entity is listed when it has 5+ such dated keys, or when two of its keys collapse to the same slot once the date is stripped ("deploy (2026-08-12)" and "deploy (2026-08-20)") - the latter is a same-fact duplicate that duplicateCandidates cannot see, because every key is unique. Each item is {entityName, datedKeys, totalObservations, sameSlotGroups:[{slot, count, keyPrefixes}]}. To fix: keep the current value as one dateless state slot written with add_facts.upsertKeyed (date inside the value), and prune the superseded snapshots by feeding each keyPrefix to remove_facts.observationPrefix, or move them to the session log if the history is worth keeping. SessionLog entities are exempt because they are journals by design
-- unresolvedMarkers: observations still carrying TODO / TBD / 待確認 / 待驗證 / 待定 / 待補 / 暫定. These are facts recorded while something was undecided; once decided, nobody goes back to update them, so they age silently. Each item is {entityName, count, markers, excerpts} with excerpts truncated to 120 chars. Re-check each: settled -> overwrite the slot with upsertKeyed; still open -> leave it; obsolete -> remove_facts
+- unresolvedMarkers: observations still carrying TODO / TBD / 待確認 / 待驗證 / 待定 / 待補 / 暫定. These are facts recorded while something was undecided; once decided, nobody goes back to update them, so they age silently. Each item is {entityName, count, markers, excerpts} where count is exact and excerpts sample at most 3, each truncated to 120 chars. Re-check each: settled -> overwrite the slot with upsertKeyed; still open -> leave it; obsolete -> remove_facts
+- SessionLog entities are exempt from all three of duplicateCandidates, journalEntities, and unresolvedMarkers: a session log is a journal whose pending blocks are meant to list open items, so all three would fire on it every time, and a signal that always fires is not a signal. Its size is governed by the block-retention cap instead
 - oversizedEntities: entities whose observation count (>=50) or total observation characters (>=10,000) reach curation thresholds, sorted by totalChars descending. Advisory only: such hub entities eat a large share of the output budget whenever search/get matches them - split them into smaller entities or prune stale observations
 - stats: entity/relation/observation counts and per-entityType distribution for the audited database
 
