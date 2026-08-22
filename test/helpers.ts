@@ -1,7 +1,7 @@
 // stdio 整合測試的共享輔助：spawn 真實 server 子行程、逐行解析 stdout 的
 // JSON-RPC 訊息，收到 waitForId 的回應（無論 result 或 error）即結束。
-// 三個 stdio 測試檔（pagination / tool-errors / observation-ops）共用此份，
-// 避免各自維護一份驅動碼。
+// 各 stdio 測試檔（pagination / tool-errors / observation-ops / projectroot-diagnostics
+// / large-payload）共用此份，避免各自維護一份驅動碼。
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -35,16 +35,35 @@ export function tmpRoot(prefix: string): string {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-export function driveServer(
+// 一次 stdio session 的完整產出。stderr 收全文（含啟動橫幅），供斷言診斷日誌。
+export interface ServerRun {
+  messages: any[];
+  stderr: string;
+}
+
+// 只要 stdout 的 JSON-RPC 訊息（既有呼叫端的簽名，未變）。
+export async function driveServer(
   args: string[],
   messages: object[],
   waitForId: number,
   timeoutMs = 5000,
 ): Promise<any[]> {
+  return (await runServer(args, messages, waitForId, timeoutMs)).messages;
+}
+
+// 同時取回 stderr。診斷輸出走 stderr（stdout 為 MCP 協議專用），
+// 因此驗證診斷日誌必須實際接上子行程的 stderr 管線。
+export function runServer(
+  args: string[],
+  messages: object[],
+  waitForId: number,
+  timeoutMs = 5000,
+): Promise<ServerRun> {
   return new Promise((resolve, reject) => {
-    const child = spawn('node', [SERVER, ...args], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const child = spawn('node', [SERVER, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
     const out: any[] = [];
     let buf = '';
+    let err = '';
     let done = false;
     const finish = () => {
       if (done) return;
@@ -56,7 +75,7 @@ export function driveServer(
         /* noop */
       }
       child.kill();
-      resolve(out);
+      resolve({ messages: out, stderr: err });
     };
     const timer = setTimeout(finish, timeoutMs);
     child.on('error', err => {
@@ -65,6 +84,10 @@ export function driveServer(
         clearTimeout(timer);
         reject(err);
       }
+    });
+    child.stderr.setEncoding('utf-8');
+    child.stderr.on('data', (chunk: string) => {
+      err += chunk;
     });
     child.stdout.setEncoding('utf-8');
     child.stdout.on('data', (chunk: string) => {

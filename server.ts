@@ -7,13 +7,15 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   type CallToolRequest,
+  type RequestId,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { pkg, maxOutputChars } from './config.js';
+import { pkg, maxOutputChars, workspaceOnly } from './config.js';
 import {
   knowledgeGraphManager,
   formatGraphPretty,
   formatGraphConcise,
+  PROJECT_ROOT_REQUIRED_MESSAGE,
   type KnowledgeGraph,
   type Entity,
   type Relation,
@@ -145,6 +147,65 @@ export function capText(text: string, max: number): string {
   return text.slice(0, budget) + notice;
 }
 
+// 澳門為固定 UTC+8 且無夏令時，因此「先平移 8 小時、再把 UTC 渲染尾端的 Z 換成 +08:00」
+// 與逐欄位格式化等價，且無需 Intl 或額外依賴。
+// 位移必須顯式寫出：這個時間戳存在的唯一目的是與客戶端日誌對拍定位故障窗口，
+// 裸時間（或預設 UTC 的 Z）會讓兩份日誌差 8 小時而對不上帳。
+const MACAU_OFFSET_MS = 8 * 60 * 60 * 1000;
+export function macauIsoTimestamp(now: Date = new Date()): string {
+  // toISOString() 產出 'YYYY-MM-DDTHH:mm:ss.sssZ'，slice(0,23) 去掉尾端的 Z。
+  return `${new Date(now.getTime() + MACAU_OFFSET_MS).toISOString().slice(0, 23)}+08:00`;
+}
+
+// 「實際收到了什麼」的診斷抬頭。缺參數的錯誤只說「缺 X」時，兩種成因共用同一句話而
+// 無法分辨：客戶端橋接層送出時就丟了鍵（arguments 裡其餘鍵俱在、獨缺一個），
+// 與呼叫端真的沒傳。修法南轅北轍，故必須把鍵清單釘進訊息。
+// `args === undefined` 代表 params 根本沒有 arguments 鍵——這與 `arguments: {}` 是兩種
+// 不同的客戶端故障形態（整包沒送 vs 送了空物件），共用 (none) 會讓判讀表把兩者混為一談。
+// bytes 為 arguments 重新序列化後的 UTF-8 位元組數（非原始線上位元組，量級足以判斷
+// payload 是否被截斷）；CJK 每字 3 bytes，位元組數與字元數的落差正是判斷依據。
+export function argsDiagnostic(toolName: string, args: Record<string, unknown> | undefined): string {
+  const received = args === undefined
+    ? '(arguments key absent)'
+    : (Object.keys(args).length > 0 ? Object.keys(args).join(',') : '(none)');
+  const bytes = args === undefined ? 0 : Buffer.byteLength(JSON.stringify(args), 'utf-8');
+  return `[diagnostic] tool=${toolName}; received keys: ${received}; arguments bytes=${bytes}`;
+}
+
+// 工具呼叫的拒絕原因。分四類而非一句「缺參數」，是因為它們對應**不同的客戶端故障形態**，
+// 需要能分別 grep：整包 arguments 沒送、工具名被損壞、缺資料參數、缺 projectRoot。
+type RejectReason =
+  | 'unknown-tool'
+  | 'arguments-key-absent'
+  | 'missing-required-args'
+  | 'missing-project-root';
+
+// 工具呼叫的統一拒絕路徑：訊息附診斷抬頭，並在 stderr 留一行帶時間戳與請求 id 的紀錄。
+// 為何要寫 stderr——錯誤訊息只回到模型手中，事後在伺服器端不留任何痕跡；要證實
+// 「某個時間窗口客戶端連續丟鍵」就必須有可與客戶端日誌對拍的伺服器端紀錄。
+// ⚠️ **每一條拒絕路徑都必須走這裡**。曾經只接了缺參數兩條，於是「整包 arguments 丟失」
+// 與「工具名損壞」靜默通過，而那兩者恰恰是客戶端故障最極端的形態——結果是
+// 「stderr 沒紀錄＝請求沒到伺服器」這條判讀規則本身會給出假結論。
+// reqId 是 JSON-RPC 請求 id，客戶端日誌以它索引；缺了就只能靠毫秒時間戳猜對應關係。
+// 只在拒絕路徑寫（成功路徑不寫）：必然出現的信號不是信號。
+// stdout 為 MCP 協議專用，故診斷一律走 stderr。
+// 前綴刻意用 `[aim-memory]`（客戶端掛載此 server 的慣用名稱）而非套件名，
+// 讓伺服器端與客戶端兩份日誌能用同一個字串 grep。
+function rejectToolCall(
+  reason: RejectReason,
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  requestId: RequestId | undefined,
+  message: string,
+): never {
+  const diagnostic = argsDiagnostic(toolName, args);
+  const reqId = requestId === undefined ? '(unknown)' : String(requestId);
+  console.error(
+    `${macauIsoTimestamp()} [aim-memory] tool call rejected (${reason}) — reqId=${reqId}; ${diagnostic}`,
+  );
+  throw new Error(`${message} ${diagnostic}`);
+}
+
 // 伺服器實例與公開給 AI 模型的工具
 export const server = new Server({
   name: pkg.name,
@@ -159,27 +220,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOL_DEFINITIONS };
 });
 
-// 依工具 schema 的 required 檢查必要參數是否存在，提供比下游 TypeError
-// 更清楚的錯誤訊息。projectRoot 交由 storage 層處理（其訊息更具指引性），
-// 這裡略過以免蓋掉 workspace-only 的專屬提示。
-function assertRequiredArgs(toolName: string, args: Record<string, unknown>): void {
+// 工具呼叫的單一驗證入口，依序檢查四件事並一律走 rejectToolCall（診斷 + stderr）：
+// 工具名是否存在、arguments 鍵是否存在、schema 的必填資料參數、workspace-only 的 projectRoot。
+// 順序有意義：工具名未知時無從得知它的 required 清單，故必須最先判。
+// projectRoot 的訊息主文沿用 storage 的單一真相常量（指引性更強），但診斷抬頭只能在此
+// 產生——storage 的 getMemoryFilePath 只收到解析後的 projectRoot，結構上看不到呼叫端
+// 實際送來哪些鍵。storage 的同一道檢查保留為最後防線（程式化消費者可繞過 server 層）。
+function assertToolCallArgs(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  requestId: RequestId | undefined,
+): asserts args is Record<string, unknown> {
   const tool = TOOL_DEFINITIONS.find(t => t.name === toolName);
   // 未知工具在此就明確報錯：否則下面存取 undefined.inputSchema 會丟出隱晦的 TypeError
   // （"Cannot read properties of undefined"），且早於 dispatchTool 的 switch，讓其
   // default 分支的 "Unknown tool" 訊息對「名稱不在定義」的情況永遠走不到。
   if (!tool) {
-    throw new Error(`Unknown tool: ${toolName}`);
+    rejectToolCall('unknown-tool', toolName, args, requestId, `Unknown tool: ${toolName}`);
+  }
+  if (!args) {
+    rejectToolCall(
+      'arguments-key-absent',
+      toolName,
+      undefined,
+      requestId,
+      `No arguments provided for tool: ${toolName}`,
+    );
   }
   const required = (tool.inputSchema as { required?: string[] }).required ?? [];
   const missing = required.filter(key => key !== 'projectRoot' && args[key] === undefined);
   if (missing.length > 0) {
-    throw new Error(`Missing required argument(s) for ${toolName}: ${missing.join(', ')}`);
+    rejectToolCall(
+      'missing-required-args',
+      toolName,
+      args,
+      requestId,
+      `Missing required argument(s) for ${toolName}: ${missing.join(', ')}`,
+    );
+  }
+  if (workspaceOnly && args.projectRoot === undefined) {
+    rejectToolCall('missing-project-root', toolName, args, requestId, PROJECT_ROOT_REQUIRED_MESSAGE);
   }
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// extra.requestId 是本次 tools/call 的 JSON-RPC id。SDK 明確為此用途提供它
+// （"useful for tracking or logging purposes"），拒絕路徑的 stderr 紀錄靠它才能與
+// 客戶端日誌一一對應，而不是靠毫秒時間戳猜。
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   try {
-    return await dispatchTool(request);
+    return await dispatchTool(request, extra.requestId);
   } catch (error) {
     // 工具層錯誤一律回傳 isError:true 的正常結果，而非拋出讓 SDK 產生協議級
     // JSON-RPC 錯誤（-32603）。有客戶端會把任何協議級錯誤誤判為連線故障，
@@ -191,14 +280,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function dispatchTool(request: CallToolRequest) {
+async function dispatchTool(request: CallToolRequest, requestId?: RequestId) {
   const { name, arguments: args } = request.params;
 
-  if (!args) {
-    throw new Error(`No arguments provided for tool: ${name}`);
-  }
-
-  assertRequiredArgs(name, args as Record<string, unknown>);
+  assertToolCallArgs(name, args, requestId);
 
   // 「選哪個 store」的三元組在每個工具都以相同尾隨參數傳給 storage 層；
   // 在此解構一次，取代各 case 重複的 `args.context as ... , args.location as ... , args.projectRoot as ...` cast。

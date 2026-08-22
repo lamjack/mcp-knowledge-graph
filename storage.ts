@@ -107,6 +107,13 @@ async function readDatabaseNames(dir: string): Promise<string[]> {
   }
 }
 
+// Workspace-only 模式下缺 projectRoot 的拒絕訊息（單一真相）。
+// 匯出的原因是診斷資訊分屬兩層：本層只收到解析後的 projectRoot，結構上不可能知道
+// 呼叫端「實際送來哪些鍵」；server 層才拿得到原始 arguments，故由它在此句之後補上
+// 鍵清單與 payload 字節數（見 server.ts argsDiagnostic）。共用同一常量避免兩處訊息漂移。
+export const PROJECT_ROOT_REQUIRED_MESSAGE =
+  'Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.';
+
 // 依據 context 與可選的 location 覆蓋取得記憶檔案路徑。
 // 匯出供測試使用：驗證多工作區 projectRoot 路由。
 export function getMemoryFilePath(context?: string, location?: 'project' | 'global', projectRoot?: string, workspaceOnly: boolean = configWorkspaceOnly): string {
@@ -123,7 +130,7 @@ export function getMemoryFilePath(context?: string, location?: 'project' | 'glob
       throw new Error('Workspace-only mode: global storage is disabled. Remove location:"global".');
     }
     if (projectRoot === undefined) {
-      throw new Error('Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.');
+      throw new Error(PROJECT_ROOT_REQUIRED_MESSAGE);
     }
   }
 
@@ -1357,7 +1364,7 @@ export class KnowledgeGraphManager {
     // Workspace-only 嚴格模式：強制帶 projectRoot、僅列本 workspace，永不觸及全域。
     if (this.workspaceOnly) {
       if (projectRoot === undefined) {
-        throw new Error('Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.');
+        throw new Error(PROJECT_ROOT_REQUIRED_MESSAGE);
       }
       assertProjectRootSafe(projectRoot);
       const aimDir = path.join(projectRoot, AIM_DIR_NAME);

@@ -346,6 +346,43 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
 - 手動建立的 JSONL 檔案需以 `{"type":"_aim","source":"mcp-knowledge-graph"}` 作為第一行
 - 若手動建立了檔案，請加入 `_aim` 標記或刪除後讓系統重新建立
 
+### 間歇性的「Workspace-only mode: projectRoot is required」（客戶端橋接層丟鍵）
+
+**已知坑**：部分 MCP 客戶端的橋接層會**間歇性丟失參數鍵**，最常見的表現就是這句 `projectRoot is required`——同一個 payload 隔幾分鐘重試即成功、與內容大小／中英文／鍵序無關、持續數小時正常後突然一段窗口連續失敗再自愈。**遇到時重試即可**；若持續失敗，請檢查客戶端的 MCP 連線狀態（重連風暴期間客戶端會殺掉並重啟健康的 server 行程，重試時觀察到丟參數）。
+
+伺服器端已具備分辨能力，**不必再猜**。**每一條**工具呼叫的拒絕路徑（未知工具名、缺 arguments 鍵、缺必填資料參數、缺 `projectRoot`）都會在錯誤訊息尾端附上診斷抬頭，並在 **stderr** 留一行紀錄（stdout 為 MCP 協議專用）。以下為實際輸出：
+
+```text
+Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot. [diagnostic] tool=aim_memory_store; received keys: entities,context; arguments bytes=156
+Missing required argument(s) for aim_memory_store: entities [diagnostic] tool=aim_memory_store; received keys: (none); arguments bytes=2
+No arguments provided for tool: aim_memory_store [diagnostic] tool=aim_memory_store; received keys: (arguments key absent); arguments bytes=0
+Unknown tool: aim_memory_stroe [diagnostic] tool=aim_memory_stroe; received keys: projectRoot; arguments bytes=22
+```
+
+```text
+2026-08-23T00:57:32.455+08:00 [aim-memory] tool call rejected (missing-project-root) — reqId=41; [diagnostic] tool=aim_memory_store; received keys: entities,context; arguments bytes=156
+2026-08-23T00:57:32.455+08:00 [aim-memory] tool call rejected (arguments-key-absent) — reqId=43; [diagnostic] tool=aim_memory_store; received keys: (arguments key absent); arguments bytes=0
+```
+
+`reqId` 是 JSON-RPC 請求 id，客戶端日誌以它索引——這是兩份日誌能一一對應的關鍵，別只靠時間戳。
+
+判讀表：
+
+| 觀察到的內容 | `reason` | 判讀 |
+| --- | --- | --- |
+| 其餘鍵俱在、**獨缺 `projectRoot`** | `missing-project-root` | 客戶端橋接層送出時丟了單一鍵。**重試即可** |
+| `received keys: (none)` | `missing-required-args` | 客戶端送出了空的 `arguments` 物件 |
+| `received keys: (arguments key absent)` | `arguments-key-absent` | 客戶端**整包 `arguments` 丟失**（最極端形態，重連重試期間可見）。檢查客戶端 MCP 連線狀態 |
+| 工具名拼錯或殘缺 | `unknown-tool` | 工具名在傳輸中被損壞 |
+| 「其他必填鍵也一起缺」 | `missing-required-args` | 呼叫端真的沒傳，補參數即可 |
+| 客戶端報錯，但伺服器 stderr **找不到**對應 `reqId` 的 `tool call rejected` 行 | — | 請求根本沒送到伺服器，錯誤由客戶端自行合成。查客戶端，不必查伺服器 |
+
+> ⚠️ 最後一列成立的前提是**四條拒絕路徑全部都寫 stderr**。新增任何拒絕路徑時務必一併接上 `rejectToolCall`，否則這條判讀規則會反過來給出假結論（漏記的路徑會被誤判成「請求沒到伺服器」）。
+
+`arguments bytes` 是 arguments 重新序列化後的 UTF-8 位元組數（CJK 每字 3 bytes），用來判斷 payload 是否被攔腰截斷。
+
+伺服器端已排除嫌疑：`test/large-payload.test.ts` 以真實 server 子行程連續執行 50 輪 `store` + `add_facts`（每條 observation ≥ 8KB 中文），全數成功且落盤完整。
+
 ### 記憶儲存至非預期位置
 
 - 確認 Cascade 呼叫時帶了正確的 `projectRoot`（當前 workspace 絕對路徑）
