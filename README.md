@@ -366,6 +366,25 @@ Unknown tool: aim_memory_stroe [diagnostic] tool=aim_memory_stroe; received keys
 
 `reqId` 是 JSON-RPC 請求 id，客戶端日誌以它索引——這是兩份日誌能一一對應的關鍵，別只靠時間戳。
 
+> ⚠️ **客戶端未必收 stderr**。實測 Devin 產生的 server 行程 FD2 直接指向 `/dev/null`（`lsof -p <pid>` 可確認），上面那行連同 `reqId` 全部被丟棄，事後對拍在該客戶端上不成立。**錯誤訊息本身不受影響**（模型看得到，JSON-RPC 回應也自帶 id），受影響的只有事後追查。要保住事後追查能力，加上檔案 sink：
+
+```json
+{
+  "mcpServers": {
+    "aim-memory": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/knowledge-graph-mcp/dist/index.js",
+        "--workspace-only",
+        "--diagnostic-log=/absolute/path/to/aim-diagnostic.log"
+      ]
+    }
+  }
+}
+```
+
+等效環境變數為 `AIM_DIAGNOSTIC_LOG`。行為：**預設關閉**（未配置就不產生任何檔案）；只在拒絕路徑追寫（成功路徑不寫，故沒有拒絕就連檔案都不會建立）；追寫而非覆寫，因為要診斷的正是連續失敗的那個窗口；寫檔失敗只降級為 stderr 警告，絕不弄壞工具回應。建議給絕對路徑——多工作區 IDE 的 cwd 不可靠。
+
 判讀表：
 
 | 觀察到的內容 | `reason` | 判讀 |
@@ -375,7 +394,7 @@ Unknown tool: aim_memory_stroe [diagnostic] tool=aim_memory_stroe; received keys
 | `received keys: (arguments key absent)` | `arguments-key-absent` | 客戶端**整包 `arguments` 丟失**（最極端形態，重連重試期間可見）。檢查客戶端 MCP 連線狀態 |
 | 工具名拼錯或殘缺 | `unknown-tool` | 工具名在傳輸中被損壞 |
 | 「其他必填鍵也一起缺」 | `missing-required-args` | 呼叫端真的沒傳，補參數即可 |
-| 客戶端報錯，但伺服器 stderr **找不到**對應 `reqId` 的 `tool call rejected` 行 | — | 請求根本沒送到伺服器，錯誤由客戶端自行合成。查客戶端，不必查伺服器 |
+| 紀錄裡**找不到**對應 `reqId` 的 `tool call rejected` 行 | — | 請求根本沒送到伺服器，錯誤由客戶端自行合成。查客戶端，不必查伺服器。⚠️ 前提是紀錄真的收得到——先確認客戶端有收 stderr，或已配置 `--diagnostic-log` |
 
 > ⚠️ 最後一列成立的前提是**四條拒絕路徑全部都寫 stderr**。新增任何拒絕路徑時務必一併接上 `rejectToolCall`，否則這條判讀規則會反過來給出假結論（漏記的路徑會被誤判成「請求沒到伺服器」）。
 

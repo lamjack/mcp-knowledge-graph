@@ -10,7 +10,9 @@ import {
   type RequestId,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { pkg, maxOutputChars, workspaceOnly } from './config.js';
+import { appendFileSync } from 'fs';
+
+import { pkg, maxOutputChars, workspaceOnly, diagnosticLogPath } from './config.js';
 import {
   knowledgeGraphManager,
   formatGraphPretty,
@@ -200,10 +202,25 @@ function rejectToolCall(
 ): never {
   const diagnostic = argsDiagnostic(toolName, args);
   const reqId = requestId === undefined ? '(unknown)' : String(requestId);
-  console.error(
-    `${macauIsoTimestamp()} [aim-memory] tool call rejected (${reason}) — reqId=${reqId}; ${diagnostic}`,
-  );
+  const record = `${macauIsoTimestamp()} [aim-memory] tool call rejected (${reason}) — reqId=${reqId}; ${diagnostic}`;
+  console.error(record);
+  writeDiagnosticRecord(record);
   throw new Error(`${message} ${diagnostic}`);
+}
+
+// 把拒絕紀錄追寫到可選的檔案 sink（--diagnostic-log / AIM_DIAGNOSTIC_LOG）。
+// 追寫而非覆寫：要診斷的正是「連續失敗的那個窗口」，覆寫只會留下最後一筆。
+// 同步寫入是刻意的——這條路徑罕見（只在拒絕時走），換取紀錄不會因行程結束而遺失。
+// 寫檔失敗只降級為 stderr 警告，絕不讓診斷輔助本身弄壞工具回應；若該客戶端連 stderr
+// 都丟棄，這則警告也會消失，這是 sink 不可用時能做到的極限。
+function writeDiagnosticRecord(record: string): void {
+  if (diagnosticLogPath === undefined) return;
+  try {
+    appendFileSync(diagnosticLogPath, `${record}\n`, 'utf-8');
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(`${macauIsoTimestamp()} [aim-memory] diagnostic log write failed: ${reason}`);
+  }
 }
 
 // 伺服器實例與公開給 AI 模型的工具

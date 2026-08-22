@@ -66,6 +66,19 @@ export const workspaceOnly: boolean =
 // 優雅截斷並附指引，永不撐爆客戶端。可透過 `--max-output-chars` 或 AIM_MAX_OUTPUT_CHARS 覆寫。
 // 預設值刻意保守（遠低於常見客戶端上限），因各客戶端實際上限未公開；建議搭配分頁與
 // includeObservations:false 作為主要手段，此上限僅為最後防線。
+// 拒絕紀錄的可選檔案 sink（`--diagnostic-log <path>` 或 AIM_DIAGNOSTIC_LOG）。
+// 為何需要它：拒絕紀錄寫 stderr，但**客戶端未必收 stderr**——實測 Devin 產生的 server
+// 行程 FD2 直接指向 /dev/null（`lsof -p <pid>` 確認），整行連同 reqId 全被丟棄，
+// 「事後與客戶端日誌對拍」在該客戶端上完全不成立。檔案 sink 讓紀錄不依賴客戶端行為。
+// 預設關閉（undefined）：沒配置就一個檔案都不產生，不在使用者沒要求的地方留垃圾。
+// 相對路徑比照 --memory-path 以 cwd 解析；多工作區 IDE 的 cwd 不可靠，建議一律給絕對路徑。
+function resolveDiagnosticLogPath(): string | undefined {
+  const raw = argv['diagnostic-log'] ?? process.env.AIM_DIAGNOSTIC_LOG;
+  if (typeof raw !== 'string' || raw === '') return undefined;
+  return isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
+}
+export const diagnosticLogPath: string | undefined = resolveDiagnosticLogPath();
+
 const DEFAULT_MAX_OUTPUT_CHARS = 50_000;
 function resolveMaxOutputChars(): number {
   const raw = argv['max-output-chars'] ?? process.env.AIM_MAX_OUTPUT_CHARS;

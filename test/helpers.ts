@@ -53,14 +53,20 @@ export async function driveServer(
 
 // 同時取回 stderr。診斷輸出走 stderr（stdout 為 MCP 協議專用），
 // 因此驗證診斷日誌必須實際接上子行程的 stderr 管線。
+// env 供驗證環境變數形式的配置——MCP 客戶端設定檔多以 env 區塊傳參，
+// 只測 CLI 旗標會讓實際最常用的那條路徑無人守衛。
 export function runServer(
   args: string[],
   messages: object[],
   waitForId: number,
   timeoutMs = 5000,
+  env?: Record<string, string>,
 ): Promise<ServerRun> {
   return new Promise((resolve, reject) => {
-    const child = spawn('node', [SERVER, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('node', [SERVER, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
     const out: any[] = [];
     let buf = '';
     let err = '';

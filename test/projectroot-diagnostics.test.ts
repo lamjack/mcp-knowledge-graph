@@ -14,6 +14,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 
 import { argsDiagnostic, macauIsoTimestamp } from '../server.js';
 import { PROJECT_ROOT_REQUIRED_MESSAGE } from '../storage.js';
@@ -199,6 +201,82 @@ test('缺必填資料參數：stderr 行的 reason 與缺 projectRoot 分辨得�
     4,
   );
   assert.match(stderr, stderrLine('missing-required-args', 4, 'aim_memory_store', 'projectRoot'));
+});
+
+// --- 診斷檔案 sink（stdio 整合） --------------------------------------------
+
+// 為何需要檔案 sink：實測 Devin 產生的 server 行程 FD2 直接指向 /dev/null
+// （`lsof -p <pid>` 確認），stderr 那一行連同 reqId 全部被丟棄，「事後與客戶端日誌對拍」
+// 在該客戶端上完全不成立。檔案 sink 讓紀錄不依賴客戶端如何處置 stderr。
+// 預設關閉：未配置時不得產生任何檔案，否則會在使用者沒要求的地方留下垃圾。
+
+test('--diagnostic-log：拒絕紀錄追寫到檔案，內容與 stderr 同一行', async () => {
+  const root = tmpRoot();
+  const logFile = path.join(root, 'diagnostic.log');
+  const { stderr } = await runServer(
+    ['--workspace-only', `--diagnostic-log=${logFile}`],
+    [INIT, INITIALIZED, call(8, 'aim_memory_store', { entities: [] })],
+    8,
+  );
+  const expected = stderrLine('missing-project-root', 8, 'aim_memory_store', 'entities');
+  assert.match(stderr, expected, 'precondition: stderr 仍須照寫');
+  assert.ok(existsSync(logFile), '配置了 sink 就必須產生檔案');
+  assert.match(readFileSync(logFile, 'utf-8'), expected);
+});
+
+test('AIM_DIAGNOSTIC_LOG 環境變數形式同樣生效（MCP 設定檔多以 env 傳參）', async () => {
+  const root = tmpRoot();
+  const logFile = path.join(root, 'diagnostic-env.log');
+  await runServer(
+    ['--workspace-only'],
+    [INIT, INITIALIZED, call(9, 'aim_memory_store', { entities: [] })],
+    9,
+    5000,
+    { AIM_DIAGNOSTIC_LOG: logFile },
+  );
+  assert.ok(existsSync(logFile), '環境變數形式必須與 CLI 旗標等效');
+  assert.match(
+    readFileSync(logFile, 'utf-8'),
+    stderrLine('missing-project-root', 9, 'aim_memory_store', 'entities'),
+  );
+});
+
+test('診斷檔案為追寫而非覆寫——連續故障窗口的每一筆都要留下', async () => {
+  const root = tmpRoot();
+  const logFile = path.join(root, 'diagnostic-append.log');
+  await runServer(
+    ['--workspace-only', `--diagnostic-log=${logFile}`],
+    [
+      INIT,
+      INITIALIZED,
+      call(11, 'aim_memory_store', { entities: [] }),
+      call(12, 'aim_memory_store', { entities: [] }),
+    ],
+    12,
+  );
+  const lines = readFileSync(logFile, 'utf-8').trim().split('\n');
+  assert.equal(lines.length, 2, '兩次拒絕必須是兩行，後者不得覆蓋前者');
+  assert.match(lines[0]!, /reqId=11;/);
+  assert.match(lines[1]!, /reqId=12;/);
+});
+
+test('成功路徑不建立診斷檔案——未配置與已配置皆不得產生噪音', async () => {
+  const root = tmpRoot();
+  const logFile = path.join(root, 'diagnostic-quiet.log');
+  const { messages } = await runServer(
+    ['--workspace-only', `--diagnostic-log=${logFile}`],
+    [
+      INIT,
+      INITIALIZED,
+      call(2, 'aim_memory_store', {
+        projectRoot: root,
+        entities: [{ name: 'E', entityType: 't', observations: ['x'] }],
+      }),
+    ],
+    2,
+  );
+  assert.ok(messages.find(m => m.id === 2)?.result?.isError !== true, 'precondition: 呼叫必須成功');
+  assert.equal(existsSync(logFile), false, '沒有拒絕就不該有檔案');
 });
 
 test('成功路徑不寫診斷行——必然出現的信號不是信號', async () => {
