@@ -30,6 +30,93 @@ function schemaOf(name: string): any {
   return tool!.inputSchema as any;
 }
 
+test('每個工具都帶完整 annotations：7 唯讀 / 3 純附加 / 5 破壞性，全部封閉世界', () => {
+  // 分類依據執行期行為（非描述文字）：
+  // - 唯讀 ×7：不碰圖譜。
+  // - 純附加 ×3：store 跳過既有名、link 去重、add_facts 去重，重放同參數無額外效果。
+  //   （add_facts 的 upsertKeyed 會刪同鍵行，但那是呼叫端逐 entry 顯式 opt-in，
+  //   淨效果是「狀態槽歸一」；工具本性是附加。）
+  // - 破壞性 ×5：forget / remove_facts / unlink / replace_fact 重放無額外效果（idempotent）；
+  //   update_entity 的 rename 無法重放（第二次舊名已不存在 → 報錯），idempotentHint 必須是 false。
+  // 新增工具若漏設 annotations，或改動分類而未同步此表，此測試立刻變紅。
+  const readOnly = [
+    'aim_memory_read_all',
+    'aim_memory_search',
+    'aim_memory_get',
+    'aim_memory_count_observations',
+    'aim_memory_list_stores',
+    'aim_memory_doctor',
+    'aim_memory_list_entity_types',
+  ];
+  const additive = ['aim_memory_store', 'aim_memory_add_facts', 'aim_memory_link'];
+  const destructiveIdempotent = [
+    'aim_memory_forget',
+    'aim_memory_remove_facts',
+    'aim_memory_unlink',
+    'aim_memory_replace_fact',
+  ];
+  const destructiveNonIdempotent = ['aim_memory_update_entity'];
+
+  const classified = [
+    ...readOnly,
+    ...additive,
+    ...destructiveIdempotent,
+    ...destructiveNonIdempotent,
+  ];
+  assert.deepEqual(
+    TOOL_DEFINITIONS.map(t => t.name).sort(),
+    classified.slice().sort(),
+    '每個工具都必須在下列四個分類中恰好出現一次（新增工具須先分類）',
+  );
+
+  for (const tool of TOOL_DEFINITIONS) {
+    const a = tool.annotations;
+    assert.ok(a, `${tool.name} 缺少 annotations`);
+    assert.equal(a.openWorldHint, false, `${tool.name} 作用域是本地 JSONL 圖譜（封閉世界）`);
+    const expectReadOnly = readOnly.includes(tool.name);
+    assert.equal(a.readOnlyHint, expectReadOnly, `${tool.name} 的 readOnlyHint`);
+    const expectDestructive =
+      destructiveIdempotent.includes(tool.name) || destructiveNonIdempotent.includes(tool.name);
+    assert.equal(a.destructiveHint, expectDestructive, `${tool.name} 的 destructiveHint`);
+    const expectIdempotent = !destructiveNonIdempotent.includes(tool.name);
+    assert.equal(a.idempotentHint, expectIdempotent, `${tool.name} 的 idempotentHint`);
+  }
+});
+
+test('workspace-only 的 schema 後處理不剝除 annotations（stdio 實測 tools/list）', async () => {
+  // annotations 與 description/inputSchema 同在工具物件上；尾段的 workspace-only
+  // 改寫迴圈只該碰後兩者。此測試走真實子行程的 tools/list，
+  // 防未來有人在後處理裡重建工具物件時把 annotations 丟掉。
+  const out = await driveServer(
+    ['--workspace-only'],
+    [INIT, INITIALIZED, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }],
+    2,
+  );
+  const tools: any[] = out.find(m => m.id === 2).result.tools;
+  assert.equal(tools.length, TOOL_DEFINITIONS.length);
+  for (const t of tools) {
+    assert.ok(t.annotations, `${t.name} 的 annotations 在 workspace-only 模式下被剝除`);
+    assert.equal(typeof t.annotations.readOnlyHint, 'boolean', `${t.name} 缺 readOnlyHint`);
+    assert.equal(t.annotations.openWorldHint, false, `${t.name} 的 openWorldHint 被改寫`);
+  }
+});
+
+test('formatProp 宣告的格式必須全部出現在工具描述中（模型只學描述列出者）', () => {
+  // search/get 的描述曾只列 json/pretty，而共用的 formatProp 宣告了三種（含 concise）——
+  // 模型因此只學到 2/3 的能力。描述與 schema 再度漂移時此測試變紅。
+  for (const tool of TOOL_DEFINITIONS) {
+    const props = (tool.inputSchema as any).properties ?? {};
+    const format = props.format;
+    if (!format || !Array.isArray(format.enum)) continue;
+    for (const fmt of format.enum) {
+      assert.ok(
+        tool.description!.includes(`"${fmt}"`),
+        `${tool.name} 的描述未列出 format: "${fmt}"（schema 有宣告，模型學不到）`,
+      );
+    }
+  }
+});
+
 test('派發表與工具定義完全對應：宣告了就一定能執行，能執行的一定有宣告', () => {
   const declared = TOOL_DEFINITIONS.map(t => t.name).sort();
   const dispatchable = Object.keys(TOOL_HANDLERS).sort();

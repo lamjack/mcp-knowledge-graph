@@ -1,7 +1,41 @@
 // MCP 工具 schema 定義。共享屬性片段只宣告一次（DRY），跨工具重複使用。
 
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { workspaceOnly } from "./config.js";
+
+// Tool annotations（spec 2025-06-18）：讓客戶端不必解析描述文字就能分辨唯讀與破壞性工具，
+// 並給刪除類操作一個確認 UX 的掛點。四個 hint 全部顯式給出而非依賴預設值（預設
+// readOnlyHint:false / destructiveHint:true 對本 server 的多數工具是錯的）。
+// openWorldHint 一律 false：所有工具的作用域都是本地 JSONL 圖譜，屬封閉世界。
+// 分類對應執行期行為（7 唯讀 / 3 純附加 / 5 破壞性），由 tool-contract 測試逐工具鎖定。
+const readOnlyAnnotations: ToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// store 跳過既有名、link 去重、add_facts 去重——同參數重放對環境無額外效果。
+// add_facts 的 upsertKeyed 雖會刪同鍵行，但那是呼叫端逐 entry 顯式 opt-in 的槽位歸一，
+// 工具本性是附加，故 destructiveHint 仍為 false。
+const additiveAnnotations: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const destructiveAnnotations: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// update_entity 的 rename 不可重放：第二次呼叫時舊名已不存在，會報錯而非無效果。
+const destructiveNonIdempotentAnnotations: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
 
 // 共享的 input-schema 屬性片段（單一真實來源）。
 const projectRootProp = {
@@ -29,6 +63,7 @@ const includeObservationsProp = {
 export const TOOL_DEFINITIONS: Tool[] = [
   {
     name: "aim_memory_store",
+    annotations: additiveAnnotations,
     description: `Store new memories. Use this to remember people, projects, concepts, or any information worth persisting.
 
 AIM (AI Memory) provides persistent memory for AI assistants. The 'aim_memory_' prefix groups all memory tools together.
@@ -86,6 +121,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_link",
+    annotations: additiveAnnotations,
     description: `Link two memories together with a relationship. Use this to connect related information.
 
 RELATION STRUCTURE: Each link has 'from' (subject), 'relationType' (verb), and 'to' (object).
@@ -134,6 +170,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_add_facts",
+    annotations: additiveAnnotations,
     description: `Add new facts to an existing memory. Use this to append information to something already stored.
 
 IMPORTANT: Memory must already exist - use aim_memory_store first. Throws error if not found.
@@ -190,6 +227,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_forget",
+    annotations: destructiveAnnotations,
     description: `Forget memories. Removes memories and their associated links.
 
 DATABASE SELECTION: Entities are deleted from the specified database's knowledge graph.
@@ -221,6 +259,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_remove_facts",
+    annotations: destructiveAnnotations,
     description: `Remove specific facts from a memory. Keeps the memory but removes selected observations, either by exact text or by prefix.
 
 MATCH MODES (per deletion entry, provide exactly one, non-empty):
@@ -278,6 +317,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_unlink",
+    annotations: destructiveAnnotations,
     description: `Remove links between memories. Keeps the memories but removes their connections.
 
 DATABASE SELECTION: Relations are deleted from the specified database's knowledge graph.
@@ -317,6 +357,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_read_all",
+    annotations: readOnlyAnnotations,
     description: `Read all memories in a database. Returns every stored memory and their links.
 
 FORMAT OPTIONS:
@@ -363,6 +404,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_search",
+    annotations: readOnlyAnnotations,
     description: `Search memories by keyword. Use this when you don't know the exact name of what you're looking for.
 
 WHAT IT SEARCHES: Matches query (case-insensitive) against:
@@ -375,6 +417,7 @@ VS aim_memory_get: Use aim_memory_search for fuzzy matching. Use aim_memory_get 
 FORMAT OPTIONS:
 - "json" (default): Structured JSON for programmatic use
 - "pretty": Human-readable text format
+- "concise": Token-efficient one-line-per-entity form
 
 EXAMPLES:
 - aim_memory_search({query: "John"}) - JSON format
@@ -407,6 +450,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_get",
+    annotations: readOnlyAnnotations,
     description: `Retrieve specific memories by exact name. Use this when you know exactly what you're looking for.
 
 VS aim_memory_search: Use aim_memory_get for exact name lookup. Use aim_memory_search for fuzzy matching or when you don't know exact names.
@@ -421,6 +465,7 @@ RETURNS: Requested entities and relations between them. Non-existent names are s
 FORMAT OPTIONS:
 - "json" (default): Structured JSON for programmatic use
 - "pretty": Human-readable text format
+- "concise": Token-efficient one-line-per-entity form
 
 EXAMPLES:
 - aim_memory_get({names: ["John", "TechConf2024"]}) - JSON format
@@ -459,6 +504,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_count_observations",
+    annotations: readOnlyAnnotations,
     description: `Count observations on given entities by prefix - read-only, returns counts instead of observation bodies.
 
 WHY: Deciding whether a prefix-scoped block needs pruning (e.g. "how many session blocks does this SessionLog have, and what are their timestamps?") should not require pulling full observation text - a large entity can hit the output cap. This tool answers the counting question directly with a tiny payload.
@@ -505,6 +551,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_list_stores",
+    annotations: readOnlyAnnotations,
     description: `List all available memory databases and show current storage location.
 
 DATABASE TYPES:
@@ -532,6 +579,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_update_entity",
+    annotations: destructiveNonIdempotentAnnotations,
     description: `Update a memory entity in place: rename it and/or change its entityType, without losing observations.
 
 WHY: Renaming or retyping via forget + re-store would drop the entity's relations and force re-transcribing every observation. This tool preserves observations (order unchanged) and, on rename, rewrites every relation endpoint (from/to) that pointed at the old name.
@@ -565,6 +613,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_replace_fact",
+    annotations: destructiveAnnotations,
     description: `Atomically replace matching observations on an entity with a single new observation ("delete old, add new" in one write).
 
 WHY: Key-style observations (e.g. "開發計畫編號: ...") get superseded by newer versions. Doing this by hand needs an exact-string remove_facts + add_facts (two steps); long strings fail to match and silently no-op. This tool deletes ALL observations matching a prefix OR substring and appends newText in the same write.
@@ -603,6 +652,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_doctor",
+    annotations: readOnlyAnnotations,
     description: `Read-only graph audit. Reports structural issues in a single database so you can clean them up.
 
 RETURNS an object with:
@@ -635,6 +685,7 @@ EXAMPLES:
   },
   {
     name: "aim_memory_list_entity_types",
+    annotations: readOnlyAnnotations,
     description: `Read-only. List every entityType in a database with the number of entities of that type, most frequent first.
 
 Useful for entityType vocabulary governance: spotting near-duplicate or inconsistent types before they proliferate (pair with aim_memory_doctor's typeCollisions).

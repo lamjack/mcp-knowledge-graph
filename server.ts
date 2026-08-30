@@ -19,6 +19,7 @@ import {
   formatGraphPretty,
   formatGraphConcise,
   boundedLevenshtein,
+  normalizeNonNegInt,
   findProjectRoot,
   PROJECT_ROOT_REQUIRED_MESSAGE,
   type KnowledgeGraph,
@@ -90,18 +91,12 @@ export interface PageInfo {
   nextOffset: number | null;
 }
 
-// 將 client 傳入的數值正規化為非負整數；非有限數（未提供/NaN/Infinity）回傳 undefined。
-// 與 searchNodes 的 limit/depth 正規化採相同語義，確保跨工具一致。
-function normNonNeg(raw: unknown): number | undefined {
-  return (typeof raw === 'number' && Number.isFinite(raw)) ? Math.max(0, Math.floor(raw)) : undefined;
-}
-
 // read_all 的 entity 分頁：以 offset/limit 切片 entities，relations 原樣保留。
 // 僅在確有分頁意圖（提供 limit，或 offset > 0）時啟用；否則回傳原圖且 pageInfo 為 null，
 // 維持不帶分頁參數時的既有行為（含 JSON 輸出逐位元組相容）。
 export function paginateGraph(graph: KnowledgeGraph, rawOffset: unknown, rawLimit: unknown): { graph: KnowledgeGraph; pageInfo: PageInfo | null } {
-  const offset = normNonNeg(rawOffset) ?? 0;
-  const limit = normNonNeg(rawLimit); // undefined = 不限筆數
+  const offset = normalizeNonNegInt(rawOffset) ?? 0;
+  const limit = normalizeNonNegInt(rawLimit); // undefined = 不限筆數
   const active = limit !== undefined || offset > 0;
   if (!active) return { graph, pageInfo: null };
 

@@ -292,3 +292,92 @@ test('read cache invalidates on a same-size content change (mtime, not just size
   assert.equal(served.entities.length, 1);
   assert.equal(served.entities[0]!.name, 'Zed', 'a same-size change must still invalidate the cache via mtime');
 });
+
+// ── 「0 變更不寫檔」守衛（四條此前無守衛的變更路徑）──
+// 多行程共用同一份 JSONL 時，無謂寫入會 bump mtime：其他行程的讀取快取（以
+// mtime+size 失效）全部作廢，且 read-modify-write 的 lost-update 窗口被擴大。
+// 故 0 命中的變更不得觸碰記憶檔（比照 deleteObservations / replaceFact 既有紀律，
+// 見 observation-ops.test.ts 的同款測試）。
+
+// 把記憶檔 mtime 釘到過去：若發生寫入，mtime 會變成現在。
+const PINNED_PAST = new Date('2020-01-01T00:00:00Z');
+function pinMtime(root: string): string {
+  const file = path.join(root, '.aim', 'memory.jsonl');
+  utimesSync(file, PINNED_PAST, PINNED_PAST);
+  return file;
+}
+function assertMtimeUntouched(file: string, what: string): void {
+  assert.equal(statSync(file).mtimeMs, PINNED_PAST.getTime(), `0 變更不得觸碰記憶檔（${what}）`);
+}
+
+test('createRelations 全部重複時不寫檔（不觸碰 mtime）', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      { name: 'A', entityType: 't', observations: [] },
+      { name: 'B', entityType: 't', observations: [] },
+    ],
+    undefined, undefined, root,
+  );
+  const rel = { from: 'A', to: 'B', relationType: 'knows' };
+  await mgr.createRelations([rel], undefined, undefined, root);
+  const file = pinMtime(root);
+
+  const created = await mgr.createRelations([rel], undefined, undefined, root);
+  assert.equal(created.length, 0, 'precondition: 重複關係被去重');
+  assertMtimeUntouched(file, 'createRelations 全重複');
+});
+
+test('addObservations 全部重複（含 upsertKeyed 0 取代）時不寫檔（不觸碰 mtime）', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [{ name: 'E', entityType: 't', observations: ['a', 'slot: v1'] }],
+    undefined, undefined, root,
+  );
+  const file = pinMtime(root);
+
+  const appended = await mgr.addObservations(
+    [{ entityName: 'E', contents: ['a'] }],
+    undefined, undefined, root,
+  );
+  assert.equal(appended[0]!.addedObservations.length, 0, 'precondition: 追加全重複');
+  const upserted = await mgr.addObservations(
+    [{ entityName: 'E', contents: ['slot: v1'], upsertKeyed: true }],
+    undefined, undefined, root,
+  );
+  assert.equal(upserted[0]!.addedObservations.length, 0, 'precondition: upsert 0 新增');
+  assert.equal(upserted[0]!.replacedObservations!.length, 0, 'precondition: upsert 0 取代');
+  assertMtimeUntouched(file, 'addObservations 全重複');
+});
+
+test('deleteEntities 0 命中時不寫檔（不觸碰 mtime）', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [{ name: 'A', entityType: 't', observations: [] }],
+    undefined, undefined, root,
+  );
+  const file = pinMtime(root);
+
+  await mgr.deleteEntities(['不存在'], undefined, undefined, root);
+  assertMtimeUntouched(file, 'deleteEntities 0 命中');
+});
+
+test('deleteRelations 0 命中時不寫檔（不觸碰 mtime）', async () => {
+  const root = tmpRoot();
+  const mgr = new KnowledgeGraphManager();
+  await mgr.createEntities(
+    [
+      { name: 'A', entityType: 't', observations: [] },
+      { name: 'B', entityType: 't', observations: [] },
+    ],
+    undefined, undefined, root,
+  );
+  await mgr.createRelations([{ from: 'A', to: 'B', relationType: 'knows' }], undefined, undefined, root);
+  const file = pinMtime(root);
+
+  await mgr.deleteRelations([{ from: 'A', to: 'B', relationType: '不存在' }], undefined, undefined, root);
+  assertMtimeUntouched(file, 'deleteRelations 0 命中');
+});

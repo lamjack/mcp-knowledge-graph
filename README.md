@@ -101,6 +101,7 @@ dist/
 1. 讀取（或重用快取）當前 JSONL → 2. 在記憶體中修改 → 3. 以暫存檔 + `rename()` 原子寫回整個檔案。
 
 - **同檔操作序列化**：同一檔案的並發呼叫會排隊執行，避免彼此覆寫（跨 workspace 的單一伺服器行程尤其重要）。
+- **0 變更不寫檔**：全部七條變更路徑（`store`／`link`／`add_facts`／`forget`／`remove_facts`／`unlink`／`replace_fact`）在實際無任何變更時不觸碰記憶檔。多行程共用同一份 JSONL 時，無謂寫入會 bump `mtime` 讓其他行程的讀取快取全部失效，並擴大跨行程 read-modify-write 的 lost-update 窗口。
 - **原子寫入**：先寫 `.tmp` 再 `rename`（同檔案系統上為原子操作），寫入中途崩潰不會留下截斷/損壞的記憶檔。
 - **讀取快取**：已解析的圖譜以 **`mtime`（nanosecond 精度）+ `size`** 為鍵快取，純為效能優化。任何不一致都會退回重新讀檔並重新解析；快取只回傳深拷貝，呼叫端無法透過回傳值污染快取。
 - **外部直接編輯 JSONL 是安全的**：因為快取以 `mtime + size` 失效，你在伺服器外手動編輯 `.aim/*.jsonl`（並保留首行 `_aim` 標記）後，下一次操作會偵測到檔案變動並重新載入，不會復活你刪掉的資料，也不會讀到陳舊快取。（極端情況：若在**同一時間戳**內把檔案改成**完全相同的位元組長度**，理論上可能命中舊快取；一般手動編輯不會遇到。）
@@ -162,6 +163,8 @@ my-project/
 ```
 
 ## 可用工具
+
+全部 15 個工具都帶 [MCP Tool Annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#annotations)：`readOnlyHint`（7 個唯讀工具為 `true`）、`destructiveHint`（5 個破壞性工具為 `true`：`forget`／`remove_facts`／`unlink`／`replace_fact`／`update_entity`）、`idempotentHint`（同參數重放無額外效果；`update_entity` 的改名不可重放故為 `false`）、`openWorldHint` 一律 `false`（作用域為本地 JSONL 圖譜，屬封閉世界）。客戶端可據以分辨唯讀與破壞性操作，並為刪除類操作掛上確認 UX。
 
 - `aim_memory_store` — 儲存新記憶（人物、專案、概念）。**從不覆蓋**：名稱已存在的實體會被跳過、其 observations 整批丟棄——此時回傳 `warnings` 指名該實體與丟棄條數並指向 `add_facts`（過去這是靜默的，看起來像寫入成功但事實從未落地）。若新 `entityType` 與既有型別僅差大小寫/底線/連字符也會附 `warnings`（皆不阻斷寫入）
 - `aim_memory_add_facts` — 向既有記憶新增事實。預設純追加；entry 帶 `upsertKeyed:true` 時，其中形如 `key: value` 的內容改為「同鍵覆蓋」（半形 `:` 與全形 `：` 皆視為分隔符），讓單值狀態槽永遠只有一條當前值，回傳另附 `replacedObservations`。**刻意 opt-in**：合法多值鍵（多條 `service: ...`）若誤開會被清空

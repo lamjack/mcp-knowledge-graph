@@ -527,6 +527,14 @@ export function boundedLevenshtein(a: string, b: string, max: number): number {
   return d <= max ? d : max + 1;
 }
 
+// 將來自 client 的數值輸入正規化為非負整數：有限數 → 取下限 0 的整數；
+// 其餘（未提供/NaN/Infinity/非數值）→ undefined，由各呼叫端套用自己的預設值
+// （offset 預設 0、limit 不設上限、depth 預設 1）。此語義曾分散三處、靠註釋維持同步，
+// 單一出口後由 server.ts（read_all 分頁）與本檔 searchNodes（limit/depth）共用。
+export function normalizeNonNegInt(raw: unknown): number | undefined {
+  return (typeof raw === 'number' && Number.isFinite(raw)) ? Math.max(0, Math.floor(raw)) : undefined;
+}
+
 // KnowledgeGraphManager 類別包含所有與知識圖譜互動的操作
 export class KnowledgeGraphManager {
   // Workspace-only 嚴格模式旗標。預設取自執行時配置，可由建構子覆寫（供測試）。
@@ -748,6 +756,8 @@ export class KnowledgeGraphManager {
       // O(R+k) 去重：以關係鍵 Set 取代 filter 內嵌套 .some 的 O(k·R)。
       const existingKeys = new Set(graph.relations.map(relationKey));
       const newRelations = relations.filter(r => !existingKeys.has(relationKey(r)));
+      // 全重複就不寫檔（比照 createEntities 的 0 新增不觸碰 mtime）。
+      if (newRelations.length === 0) return newRelations;
       graph.relations.push(...newRelations);
       await this.saveGraph(graph, filePath);
       return newRelations;
@@ -794,7 +804,11 @@ export class KnowledgeGraphManager {
         entity.observations = [...kept, ...newObservations];
         return { entityName: o.entityName, addedObservations: newObservations, replacedObservations };
       });
-      await this.saveGraph(graph, filePath);
+      // 整批 0 新增且 0 取代就不寫檔（比照 deleteObservations 的 0 刪除不觸碰 mtime）。
+      const changed = results.some(
+        r => r.addedObservations.length > 0 || (r.replacedObservations?.length ?? 0) > 0,
+      );
+      if (changed) await this.saveGraph(graph, filePath);
       return results;
     });
   }
@@ -805,8 +819,12 @@ export class KnowledgeGraphManager {
       const graph = await this.loadGraph(filePath);
       // Set 成員判斷：O(N+R+D) 取代 Array.includes 內嵌於 filter 的 O((N+R)·D)。
       const toDelete = new Set(entityNames);
-      graph.entities = graph.entities.filter(e => !toDelete.has(e.name));
-      graph.relations = graph.relations.filter(r => !toDelete.has(r.from) && !toDelete.has(r.to));
+      const keptEntities = graph.entities.filter(e => !toDelete.has(e.name));
+      const keptRelations = graph.relations.filter(r => !toDelete.has(r.from) && !toDelete.has(r.to));
+      // 0 命中（無該實體、連帶也無關係可刪）就不寫檔（比照 createEntities 的 0 新增不觸碰 mtime）。
+      if (keptEntities.length === graph.entities.length && keptRelations.length === graph.relations.length) return;
+      graph.entities = keptEntities;
+      graph.relations = keptRelations;
       await this.saveGraph(graph, filePath);
     });
   }
@@ -919,7 +937,10 @@ export class KnowledgeGraphManager {
       const graph = await this.loadGraph(filePath);
       // O(R+D) 刪除：以關係鍵 Set 取代 filter 內嵌套 .some 的 O(R·D)。
       const toDelete = new Set(relations.map(relationKey));
-      graph.relations = graph.relations.filter(r => !toDelete.has(relationKey(r)));
+      const kept = graph.relations.filter(r => !toDelete.has(relationKey(r)));
+      // 0 命中就不寫檔（比照 deleteObservations 的 0 刪除不觸碰 mtime）。
+      if (kept.length === graph.relations.length) return;
+      graph.relations = kept;
       await this.saveGraph(graph, filePath);
     });
   }
@@ -1042,18 +1063,15 @@ export class KnowledgeGraphManager {
       .filter(s => s.score > 0)
       .sort((a, b) => b.score - a.score || a.e.name.localeCompare(b.e.name));
 
-    // 正規化來自 client 的數值輸入（可能是浮點、負數、NaN 或 Infinity）。
-    // limit：有限數 → 取下限 0 的整數（負值視為 0，回空結果）；其餘（未提供/NaN/Infinity）→ 不設上限。
-    const rawLimit = options?.limit;
-    const limit = (typeof rawLimit === 'number' && Number.isFinite(rawLimit)) ? Math.max(0, Math.floor(rawLimit)) : undefined;
+    // limit：負值視為 0（回空結果）；未提供/NaN/Infinity → undefined = 不設上限。
+    const limit = normalizeNonNegInt(options?.limit);
     const seeds = (limit !== undefined) ? scored.slice(0, limit) : scored;
     const seedNames = seeds.map(s => s.e.name);
     const seedSet = new Set(seedNames);
 
     // ego-graph 擴展：由 seeds 出發，逐層（BFS）納入 depth 跳內的鄰居。
-    // depth：有限數 → 取下限 0 的整數；其餘（未提供/NaN/Infinity）→ 預設 1。
-    const rawDepth = options?.depth;
-    const depth = (typeof rawDepth === 'number' && Number.isFinite(rawDepth)) ? Math.max(0, Math.floor(rawDepth)) : 1;
+    // depth：未提供/NaN/Infinity → 預設 1。
+    const depth = normalizeNonNegInt(options?.depth) ?? 1;
     // 鄰接表：每跳只走前沿節點的邊（O(觸及邊數）），取代每跳掃全部關係的 O(depth·R)。
     const adjacency = new Map<string, string[]>();
     const addAdj = (a: string, b: string) => {
