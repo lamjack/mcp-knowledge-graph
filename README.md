@@ -346,11 +346,58 @@ aim_memory_list_stores({ projectRoot: "/Users/you/dev/my-project" })
 - 手動建立的 JSONL 檔案需以 `{"type":"_aim","source":"mcp-knowledge-graph"}` 作為第一行
 - 若手動建立了檔案，請加入 `_aim` 標記或刪除後讓系統重新建立
 
-### 間歇性的「Workspace-only mode: projectRoot is required」（客戶端橋接層丟鍵）
+### 名稱 alias（大多數「呼叫失敗」已在此消除）
 
-**已知坑**：部分 MCP 客戶端的橋接層會**間歇性丟失參數鍵**，最常見的表現就是這句 `projectRoot is required`——同一個 payload 隔幾分鐘重試即成功、與內容大小／中英文／鍵序無關、持續數小時正常後突然一段窗口連續失敗再自愈。**遇到時重試即可**；若持續失敗，請檢查客戶端的 MCP 連線狀態（重連風暴期間客戶端會殺掉並重啟健康的 server 行程，重試時觀察到丟參數）。
+對 55 筆真實拒絕紀錄逐筆分類後，**75% 是名稱問題而非能力問題**，因此伺服器直接接受這些變體，不再讓呼叫端先失敗一輪：
 
-伺服器端已具備分辨能力，**不必再猜**。**每一條**工具呼叫的拒絕路徑（未知工具名、缺 arguments 鍵、缺必填資料參數、缺 `projectRoot`）都會在錯誤訊息尾端附上診斷抬頭，並在 **stderr** 留一行紀錄（stdout 為 MCP 協議專用）。以下為實際輸出：
+| 你送的 | 實際執行 | 成因 |
+| --- | --- | --- |
+| `search_nodes` / `open_nodes` / `read_graph` / `create_entities` / `add_observations` / `delete_entities` / `delete_observations` / `delete_relations` / `create_relations`（可帶或不帶 `aim_memory_` 前綴） | 對應的 canonical 工具 | 這九個是**上游官方 memory server 的工具名**，模型有強訓練先驗；本 fork 改了名 |
+| `recall` / `read` | `aim_memory_read_all` | `recall` 是 `memory-graph-curation` skill 的 phase 名，被當成工具名 |
+| 任何工具名掉了 `aim_memory_` 前綴 | 補上前綴後的工具 | — |
+| `get` / `count_observations` 的 `name`、`entityName` | `names`（單一字串自動包成陣列） | 取單一實體是最常見用法，複數陣列與直覺相衝 |
+| `forget` 的 `names` | `entityNames` | 同一 server 內詞彙不一致 |
+| `add_facts` 的 `facts` | `observations` | 工具名說 facts、參數卻叫 observations |
+| `search` 的 `search` / `q` / `text` / `keyword` | `query` | — |
+| `replace_fact` 的 `oldFact` / `oldObservation` / `oldText` | `matchExact` | 見下方 |
+| `replace_fact` 的 `newFact` / `newObservation` | `newText` | — |
+
+**alias 命中時，回應會前置一行** `[alias] accepted and rewritten: ...`，指出 canonical 名稱。alias 是善意的相容層而非契約，所以會明講——照著改成 canonical 名稱即可讓抬頭消失。
+
+三條安全守則：canonical 參數已存在時 alias **不覆蓋**它；值的形狀必須放得進 canonical 的宣告形狀（否則保持原樣，讓正常的缺參數錯誤發生，而不是在更深處以更含糊的訊息失敗）；語義有歧義者**一律不 alias**（例如 `remove_facts` 收到字串陣列的 `observations`）。
+
+`replace_fact` 另外新增了 **`matchExact`**：實測失敗多半在表達「把這段**原文**換成那段」，而先前只有 `matchPrefix` / `matchSubstring`——拿 substring 硬代替會過度命中（`狀態: 好` 會連 `狀態: 好極了` 一起刪掉）。知道原文時請用 `matchExact`。
+
+### 工具呼叫仍被拒絕時（先看是哪一類，別預設是客戶端的錯）
+
+alias 涵蓋不到的情形（真正拼錯的名稱、語義有歧義的參數、缺 `projectRoot`）仍會被拒絕：
+
+- **工具名真的拼錯**（如 `aim_memory_stroe`）：**錯誤訊息會附最接近的正確工具名與完整工具清單**，照著改即可。
+- **參數名未列入 alias**：**訊息會指出送來的那個鍵疑似對應哪個必填鍵**。
+- **缺 `projectRoot`**（實測佔 18%）：伺服器會先嘗試兩層後備（見下），仍無法確定才拒絕。見下方判讀。
+
+### 缺 `projectRoot` 時的後備解析
+
+`projectRoot` 是 workspace 隔離的唯一依據，猜錯就是把記憶寫進**別的專案**（曾真實發生）。因此後備分兩層，差別在「是不是猜的」：
+
+1. **MCP `roots`（協議層正解）** — 若客戶端宣告了 `roots` 能力，伺服器會呼叫 `roots/list`：
+   - **只回一個 root** → 那是客戶端明確告知的工作區，直接採用，並在回應前置
+     `[projectRoot] not provided; adopted the single workspace root reported by the client: "..."`。
+   - **回多個** → 語義不明，**不猜**，把候選列進錯誤訊息由呼叫端指定。
+   - 帶 2 秒超時，客戶端不回應則退到第 2 層。
+2. **cwd 偵測（只作建議）** — 客戶端未宣告 `roots` 時，伺服器用 `findProjectRoot()`（沿 `.aim`/`.git`/`package.json` 等標記往上找）產生候選，**只放進錯誤訊息、永不據以寫入**：
+
+   ```text
+   Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot.
+   Candidate detected: "/Users/you/dev/my-project" — pass it as projectRoot if that is your workspace
+   (this server cannot verify it, since one instance serves every workspace). [diagnostic] ...
+   ```
+
+   為何不自動採用：單一伺服器實例服務所有 workspace，而行程的 cwd 是它**啟動時**的目錄，不是當次呼叫所屬的 workspace。實測同時存在的兩個行程，一個 `cwd=/`（偵測不到任何東西）、一個剛好是某個 workspace ——此值不可信，自動採用會「很有信心地寫錯地方」。
+- **客戶端橋接層丟鍵**（較少數，但確實存在）：表現為**其餘鍵俱在、獨缺一個鍵**，最常見是 `projectRoot`；同一個 payload 隔幾分鐘重試即成功、與內容大小／中英文／鍵序無關、持續數小時正常後突然一段窗口連續失敗再自愈。**這一類重試即可**；若持續失敗，請檢查客戶端的 MCP 連線狀態（重連風暴期間客戶端會殺掉並重啟健康的 server 行程，重試時觀察到丟參數）。
+  ⚠️ **只送了一個鍵時無法區分**：例如只帶 `entities` 而無 `projectRoot`，「客戶端丟了鍵」與「呼叫端從來沒帶」在紀錄上完全一樣。此時**先檢查呼叫端規則有沒有要求一律帶 `projectRoot`**，不要直接當成客戶端 bug 重試。
+
+伺服器端具備分辨能力，**不必猜**。**每一條**工具呼叫的拒絕路徑（未知工具名、缺 arguments 鍵、缺必填資料參數、缺 `projectRoot`、已宣告但未接線）都會在錯誤訊息尾端附上診斷抬頭，並在 **stderr** 留一行紀錄（stdout 為 MCP 協議專用）。以下為實際輸出：
 
 ```text
 Workspace-only mode: projectRoot is required. Pass the current workspace absolute path as projectRoot. [diagnostic] tool=aim_memory_store; received keys: entities,context; arguments bytes=156
@@ -389,18 +436,23 @@ Unknown tool: aim_memory_stroe [diagnostic] tool=aim_memory_stroe; received keys
 
 | 觀察到的內容 | `reason` | 判讀 |
 | --- | --- | --- |
-| 其餘鍵俱在、**獨缺 `projectRoot`** | `missing-project-root` | 客戶端橋接層送出時丟了單一鍵。**重試即可** |
+| 工具名拼錯且不在 alias 表（`aim_memory_stroe`） | `unknown-tool` | 照訊息附的 `Did you mean` 與工具清單改。⚠️ 上游名稱與掉前綴的形式**不會**走到這裡——它們已被 alias 接受 |
+| 送來的鍵未列入 alias（如 `count_observations` 的 `prefix`） | `missing-required-args` | 照訊息的 `did you mean` 改 |
+| **其餘鍵俱在**、獨缺 `projectRoot` | `missing-project-root` | 客戶端橋接層送出時丟了單一鍵。**重試即可** |
+| **只送了一個鍵**且缺 `projectRoot`（如 `received keys: entities`） | `missing-project-root` | ⚠️ **無法區分**丟鍵與呼叫端從未帶。先查呼叫端規則是否要求一律帶 `projectRoot` |
 | `received keys: (none)` | `missing-required-args` | 客戶端送出了空的 `arguments` 物件 |
 | `received keys: (arguments key absent)` | `arguments-key-absent` | 客戶端**整包 `arguments` 丟失**（最極端形態，重連重試期間可見）。檢查客戶端 MCP 連線狀態 |
-| 工具名拼錯或殘缺 | `unknown-tool` | 工具名在傳輸中被損壞 |
 | 「其他必填鍵也一起缺」 | `missing-required-args` | 呼叫端真的沒傳，補參數即可 |
+| 訊息說「declared in tools/list but has no handler」 | `tool-not-dispatchable` | **本 repo 的接線 bug**（工具已宣告但未加進派發表），非客戶端問題。`test/tool-contract.test.ts` 正是為此把漂移釘死 |
 | 紀錄裡**找不到**對應 `reqId` 的 `tool call rejected` 行 | — | 請求根本沒送到伺服器，錯誤由客戶端自行合成。查客戶端，不必查伺服器。⚠️ 前提是紀錄真的收得到——先確認客戶端有收 stderr，或已配置 `--diagnostic-log` |
 
-> ⚠️ 最後一列成立的前提是**四條拒絕路徑全部都寫 stderr**。新增任何拒絕路徑時務必一併接上 `rejectToolCall`，否則這條判讀規則會反過來給出假結論（漏記的路徑會被誤判成「請求沒到伺服器」）。
+> ⚠️ 最後一列成立的前提是**每一條拒絕路徑都寫 stderr**。新增任何拒絕路徑時務必一併接上 `rejectToolCall`，否則這條判讀規則會反過來給出假結論（漏記的路徑會被誤判成「請求沒到伺服器」）。
+
+**載入時的損壞行也走同一個紀錄器**：JSONL 若有無法解析的行，會留下 `skipping malformed line ...; file=<path>; line <n>; content: <摘錄>`。這件事必須留紀錄，因為那一行不會進入記憶體圖譜，而**下一次任何寫入都會整檔重寫 → 該筆資料就此永久消失**；行號與摘錄是人工救回的唯一線索。
 
 `arguments bytes` 是 arguments 重新序列化後的 UTF-8 位元組數（CJK 每字 3 bytes），用來判斷 payload 是否被攔腰截斷。
 
-伺服器端已排除嫌疑：`test/large-payload.test.ts` 以真實 server 子行程連續執行 50 輪 `store` + `add_facts`（每條 observation ≥ 8KB 中文），全數成功且落盤完整。
+「大 payload 導致丟鍵」這個假設已被排除：`test/large-payload.test.ts` 以真實 server 子行程連續執行 50 輪 `store` + `add_facts`（每條 observation ≥ 8KB 中文），全數成功且落盤完整。⚠️ 該測試只證明這一件事——它不涵蓋用錯工具名／參數名那兩類（合計佔實測拒絕的 83%），那兩類請照本節開頭的對照處理。
 
 ### 記憶儲存至非預期位置
 

@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import { existsSync, statSync } from 'fs';
 import path, { isAbsolute } from 'path';
 import { baseMemoryPath, FILE_MARKER, workspaceOnly as configWorkspaceOnly, AIM_DIR_NAME, DB_FILE_EXT, DB_FILE_PREFIX, MASTER_DB_FILE } from './config.js';
+import { recordDiagnostic } from './diagnostics.js';
 
 // `context` 值的允許格式。context 會被插入檔名
 // （`memory-${context}.jsonl`），因此絕不能包含路徑分隔符或目錄穿越段。
@@ -501,7 +502,8 @@ function tokenizeWords(s: string): string[] {
 
 // 受限編輯距離（Levenshtein）：一旦確定距離 > max 即提早回傳 max+1，避免不必要的計算。
 // 用於 typo 容忍的近似比對（僅在查詢詞無精確命中時作為 fallback 觸發）。
-function boundedLevenshtein(a: string, b: string, max: number): number {
+// 匯出供 server 層的「工具名／參數名 did-you-mean」重用：同一套距離語義，零新依賴。
+export function boundedLevenshtein(a: string, b: string, max: number): number {
   const la = a.length;
   const lb = b.length;
   if (Math.abs(la - lb) > max) return max + 1;
@@ -607,12 +609,20 @@ export class KnowledgeGraphManager {
 
     // 處理剩餘行（跳過 metadata）。容忍損壞的行而非中止整個讀取。
     const graph: KnowledgeGraph = { entities: [], relations: [] };
-    for (const line of lines.slice(1)) {
+    for (const [offset, line] of lines.slice(1).entries()) {
       let item: any;
       try {
         item = JSON.parse(line);
       } catch {
-        console.error('Skipping malformed line while loading knowledge graph.');
+        // 跳過的行會被排除在記憶體圖譜之外，而下一次任何寫入都以 saveGraph 整檔重寫
+        // → 該筆資料就此永久消失。因此這裡必須留下足以人工救回的線索：
+        // 檔案、1-based 行號（標記為第 1 行）、以及內容摘錄。
+        // 走 recordDiagnostic 與工具拒絕路徑共用檔案 sink——stderr 不可依賴
+        // （實測某些客戶端產生的 server 行程 FD2 直接指向 /dev/null）。
+        recordDiagnostic(
+          'skipping malformed line while loading knowledge graph',
+          `file=${filePath}; line ${offset + 2}; content: ${excerptOf(line)}`,
+        );
         continue;
       }
       if (item.type === "entity") graph.entities.push(item as Entity);
@@ -1150,15 +1160,23 @@ export class KnowledgeGraphManager {
 
   // 原子「刪舊補新」：刪除某實體所有命中（matchPrefix 或 matchSubstring 二擇一）的 observation，
   // 再追加 newText（同一寫入完成）。0 命中則不追加並回傳 matched:0（防靜默 no-op）。
-  async replaceFact(entityName: string, match: { prefix?: string | undefined; substring?: string | undefined }, newText: string, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ matched: number; replaced: boolean }> {
+  async replaceFact(entityName: string, match: { prefix?: string | undefined; substring?: string | undefined; exact?: string | undefined }, newText: string, context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<{ matched: number; replaced: boolean }> {
     const hasPrefix = match.prefix !== undefined && match.prefix !== '';
     const hasSubstring = match.substring !== undefined && match.substring !== '';
-    if (hasPrefix === hasSubstring) {
-      throw new Error('replaceFact requires exactly one of matchPrefix or matchSubstring');
+    // exact 是「把這段原文換成那段」——呼叫端最自然的意圖。實測診斷紀錄裡 6 筆
+    // replace_fact 失敗全是在表達這個語義（oldFact / oldObservation），而工具當時只有
+    // prefix/substring：拿 substring 硬代替會過度命中（「狀態: 好」會連「狀態: 好極了」一起刪），
+    // 所以這是能力缺口而非命名問題，必須補上而不是靠 alias 硬湊。
+    const hasExact = match.exact !== undefined && match.exact !== '';
+    const modes = [hasPrefix, hasSubstring, hasExact].filter(Boolean).length;
+    if (modes !== 1) {
+      throw new Error('replaceFact requires exactly one of matchPrefix, matchSubstring or matchExact');
     }
-    const predicate = hasPrefix
-      ? (o: string) => o.startsWith(match.prefix!)
-      : (o: string) => o.includes(match.substring!);
+    const predicate = hasExact
+      ? (o: string) => o === match.exact!
+      : hasPrefix
+        ? (o: string) => o.startsWith(match.prefix!)
+        : (o: string) => o.includes(match.substring!);
 
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {

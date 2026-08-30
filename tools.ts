@@ -264,6 +264,12 @@ EXAMPLES:
               },
             },
             required: ["entityName"],
+            // 「恰擇一」寫進 schema 而非只在執行期強制：呼叫端讀不到約束就只能靠失敗
+            // 學習，而實測診斷日誌顯示這類參數猜錯是最大單一失敗類別之一。
+            oneOf: [
+              { required: ["observations"] },
+              { required: ["observationPrefix"] },
+            ],
           },
         },
       },
@@ -344,10 +350,12 @@ EXAMPLES:
         includeObservations: includeObservationsProp,
         offset: {
           type: "number",
+          minimum: 0,
           description: "Optional 0-based index of the first entity to return (default 0). Use with 'limit' to page through a large graph. Relations are returned in full on every page."
         },
         limit: {
           type: "number",
+          minimum: 0,
           description: "Optional maximum number of entities to return in this page. Omit to return all entities (subject to the output-size cap). When provided, the response is prefixed with a '[page]' header indicating the range and the next offset to request."
         },
       },
@@ -384,10 +392,12 @@ EXAMPLES:
         query: { type: "string", description: "Search text to match against entity names, entity types, and observation content (case-insensitive)" },
         limit: {
           type: "number",
+          minimum: 0,
           description: "Optional cap on the number of highest-ranked matching entities (seeds) to return. Results are ranked by relevance (exact name > name substring > type > observation). Neighbours pulled in by 'depth' do not count against this cap. Omit to return all matches."
         },
         depth: {
           type: "number",
+          minimum: 0,
           description: "Optional number of relationship hops to expand from each matched entity, pulling in connected neighbours for context (default 1). Use 0 to return only the matched entities and the relations strictly between them."
         },
         format: formatProp,
@@ -443,6 +453,8 @@ EXAMPLES:
         },
       },
       required: ["names"],
+      // 兩者皆可省略，故正確的表達是「不得同時出現」，而非 oneOf（後者會要求必須有一個）。
+      not: { required: ["observationPrefix", "observationSubstring"] },
     },
   },
   {
@@ -557,11 +569,12 @@ EXAMPLES:
 
 WHY: Key-style observations (e.g. "開發計畫編號: ...") get superseded by newer versions. Doing this by hand needs an exact-string remove_facts + add_facts (two steps); long strings fail to match and silently no-op. This tool deletes ALL observations matching a prefix OR substring and appends newText in the same write.
 
-MATCH: Provide exactly one of matchPrefix or matchSubstring.
+MATCH: Provide exactly one of matchExact, matchPrefix or matchSubstring. Prefer matchExact when you know the current wording - matchSubstring over-matches ("狀態: 好" also hits "狀態: 好極了" and would delete both).
 
 RETURNS: {matched: number, replaced: boolean}. If 0 observations match, nothing is appended and it returns {matched: 0, replaced: false} (never a silent no-op). Errors if the entity does not exist.
 
 EXAMPLES:
+- aim_memory_replace_fact({entityName: "R", matchExact: "版本: v1", newText: "版本: v2"})
 - aim_memory_replace_fact({entityName: "Plan", matchPrefix: "開發計畫編號:", newText: "開發計畫編號: v4"})
 - aim_memory_replace_fact({context: "work", entityName: "E", matchSubstring: "status is", newText: "status is green"})`,
     inputSchema: {
@@ -574,11 +587,18 @@ EXAMPLES:
         },
         location: locationProp,
         entityName: { type: "string", description: "The name of the entity whose observations to replace" },
-        matchPrefix: { type: "string", description: "Delete every observation that starts with this prefix. Provide exactly one of matchPrefix or matchSubstring." },
-        matchSubstring: { type: "string", description: "Delete every observation that contains this substring. Provide exactly one of matchPrefix or matchSubstring." },
+        matchExact: { type: "string", description: "Replace the observation whose text is exactly this. Use this when you know the current wording and want to supersede it. Provide exactly one of matchExact, matchPrefix or matchSubstring." },
+        matchPrefix: { type: "string", description: "Delete every observation that starts with this prefix. Provide exactly one of matchExact, matchPrefix or matchSubstring." },
+        matchSubstring: { type: "string", description: "Delete every observation that contains this substring. Provide exactly one of matchExact, matchPrefix or matchSubstring." },
         newText: { type: "string", description: "The single new observation to append after deleting matches." },
       },
       required: ["entityName", "newText"],
+      // 見 remove_facts 的同款註釋：恰擇一的約束必須對外可見。
+      oneOf: [
+        { required: ["matchExact"] },
+        { required: ["matchPrefix"] },
+        { required: ["matchSubstring"] },
+      ],
     },
   },
   {
@@ -637,6 +657,60 @@ EXAMPLES:
     },
   },
 ];
+
+// ── 名稱 alias：接受呼叫端實測會用的變體，canonical 保持與上游相容 ──
+//
+// 為何需要：55 筆真實拒絕紀錄逐筆分類後，75% 是名稱問題而非能力問題。
+// 官方 memory server 的參數名（names / entityNames / observations / deletions / query /
+// entities）與本 fork **完全一致**，故 canonical 刻意不改——改成第三套詞彙只會讓模型的
+// 生態先驗失效。alias 只做「接受」：命中時回應前置 [alias] 抬頭告知正名，
+// 不製造隱藏契約，且模型在同一 session 內就學會。
+//
+// ⚠️ 新增工具時，若它對應某個上游工具，請一併在此登記，否則模型的先驗會持續打空。
+
+// 工具名 alias。左為呼叫端實際送來的（或上游官方的）名稱，右為本 fork 的 canonical。
+// 無前綴形式不必列：resolveToolName 會自動補 aim_memory_ 前綴後再查一次。
+export const TOOL_NAME_ALIASES: Record<string, string> = {
+  // 上游官方 MCP memory server 的九個工具名（實測 search_nodes ×9、open_nodes ×1）
+  aim_memory_create_entities: 'aim_memory_store',
+  aim_memory_create_relations: 'aim_memory_link',
+  aim_memory_add_observations: 'aim_memory_add_facts',
+  aim_memory_delete_entities: 'aim_memory_forget',
+  aim_memory_delete_observations: 'aim_memory_remove_facts',
+  aim_memory_delete_relations: 'aim_memory_unlink',
+  aim_memory_read_graph: 'aim_memory_read_all',
+  aim_memory_search_nodes: 'aim_memory_search',
+  aim_memory_open_nodes: 'aim_memory_get',
+  // `recall` 不是上游名也不是本 fork 名——它是 memory-graph-curation skill 的 phase 名
+  // （phase=recall 意為「讀完整張圖」），被呼叫端當成工具名（實測 ×6）。對回 read_all
+  // 語義正確且唯讀，猜錯的代價只是多讀不是誤寫。
+  aim_memory_recall: 'aim_memory_read_all',
+  aim_memory_read: 'aim_memory_read_all',
+};
+
+// 參數名 alias（per tool）。左為呼叫端送來的，右為 canonical。
+// 只登記語義**明確等價**者；語義有歧義的一律不登記（讓正常的缺參數錯誤發生，附 did-you-mean）。
+export const PARAM_ALIASES: Record<string, Record<string, string>> = {
+  // 單一實體是 get 最常見的用法，複數陣列與直覺相衝（實測 name ×11）；
+  // entityName 則是同一 server 內 add_facts / remove_facts / replace_fact 的詞彙（×3）。
+  aim_memory_get: { name: 'names', entityName: 'names', entityNames: 'names' },
+  aim_memory_count_observations: { name: 'names', entityName: 'names', entityNames: 'names' },
+  // forget 用 entityNames（與上游 delete_entities 一致），呼叫端常寫 get 的 names（×2）。
+  aim_memory_forget: { names: 'entityNames', name: 'entityNames', entityName: 'entityNames' },
+  aim_memory_search: { search: 'query', q: 'query', text: 'query', keyword: 'query' },
+  // 工具名說 facts、參數卻叫 observations，於是呼叫端跟著工具名寫（×1）。
+  aim_memory_add_facts: { facts: 'observations' },
+  aim_memory_remove_facts: { facts: 'deletions', observations: 'deletions' },
+  // replace_fact 不存在於上游，呼叫端自創 old*/new*（×6）。old* 的語義是「這段原文」
+  // → matchExact（新增的能力），拿 matchSubstring 硬代替會過度命中。
+  aim_memory_replace_fact: {
+    oldFact: 'matchExact',
+    oldObservation: 'matchExact',
+    oldText: 'matchExact',
+    newFact: 'newText',
+    newObservation: 'newText',
+  },
+};
 
 // Workspace-only 嚴格模式：對外公告的 schema 需與執行時的 fail-closed 行為一致，
 // 否則模型會照著描述送出被拒絕的 global 呼叫。因此在此模式下：
