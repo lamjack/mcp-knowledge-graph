@@ -48,7 +48,7 @@
 ```bash
 git clone https://github.com/lamjack/mcp-knowledge-graph.git
 cd mcp-knowledge-graph
-npm install        # 安裝依賴（postinstall 會自動 build 出 dist/）
+npm install        # 安裝依賴（prepare hook 會自動 build 出 dist/）
 npm run build      # 重新編譯（可選）
 npm test           # 執行測試（可選）
 ```
@@ -107,7 +107,7 @@ dist/
 - **0 變更不寫檔**：全部七條變更路徑（`store`／`link`／`add_facts`／`forget`／`remove_facts`／`unlink`／`replace_fact`）在實際無任何變更時不觸碰記憶檔。多行程共用同一份 JSONL 時，無謂寫入會 bump `mtime` 讓其他行程的讀取快取全部失效，並擴大跨行程 read-modify-write 的 lost-update 窗口。
 - **原子寫入**：先寫 `.tmp` 再 `rename`（同檔案系統上為原子操作），寫入中途崩潰不會留下截斷/損壞的記憶檔。
 - **讀取快取**：已解析的圖譜以 **`mtime`（nanosecond 精度）+ `size`** 為鍵快取，純為效能優化。任何不一致都會退回重新讀檔並重新解析；快取只回傳深拷貝，呼叫端無法透過回傳值污染快取。
-- **外部直接編輯 JSONL 是安全的**：因為快取以 `mtime + size` 失效，你在伺服器外手動編輯 `.aim/*.jsonl`（並保留首行 `_aim` 標記）後，下一次操作會偵測到檔案變動並重新載入，不會復活你刪掉的資料，也不會讀到陳舊快取。（極端情況：若在**同一時間戳**內把檔案改成**完全相同的位元組長度**，理論上可能命中舊快取；一般手動編輯不會遇到。）
+- **外部直接編輯 JSONL 是安全的（前提：只有一個 server 行程在使用該檔案）**：因為快取以 `mtime + size` 失效，你在伺服器外手動編輯 `.aim/*.jsonl`（並保留首行 `_aim` 標記）後，下一次操作會偵測到檔案變動並重新載入，不會復活你刪掉的資料，也不會讀到陳舊快取。⚠️ 多個 server 行程共用同一 JSONL 時此外部編輯**不安全**：跨行程無寫入互斥，另一行程中已排隊的 read-modify-write 會以它先前讀到的舊圖整檔覆寫你的編輯（lost update）；編輯前先確認只有一個行程在跑（`ps -eo pid,lstart,command | grep dist/index.js`）。（極端情況：若在**同一時間戳**內把檔案改成**完全相同的位元組長度**，理論上可能命中舊快取；一般手動編輯不會遇到。）
 
 ## 使用方式
 
@@ -186,7 +186,7 @@ my-project/
 - `aim_memory_replace_fact` — 原子「刪舊補新」：刪除某實體所有命中（`matchPrefix` 或 `matchSubstring` 二擇一）的 observation，並在**同一次寫入**追加 `newText`。回傳 `{matched, replaced}`；0 命中時不追加並回傳 `{matched:0, replaced:false}`（不靜默 no-op）。適合取代 key 型 observation（如「開發計畫編號: ...」）。參數：`entityName`、`newText`（必填）、`matchPrefix?`/`matchSubstring?`（恰一）
 - `aim_memory_doctor` — 唯讀圖譜審計，回傳 `orphans`（無關係的孤兒實體）、`danglingRelations`（端點不存在的關係）、`typeCollisions`（僅差格式的 entityType 分組）、`duplicateCandidates`（同實體內共用 key 前綴的多條 observation；半形 `:` 與全形 `：` 皆為分隔符；`count` 精確、`excerpts` 每組取樣 ≤ 3 條各截斷 120 字元——合法多值鍵如多條 `service: ...` 與過時版本無法區分，一律回報但不逐字回吐，需全文時用 `get({names, observationPrefix})`）、`journalEntities`（**流水帳漂移**：key 頭內嵌日期者每寫一次就生成新鍵，結構上永遠無法被覆蓋。帶日期鍵達 5 條**且**佔該實體 30% 以上，或有多個鍵剝掉日期後指向同一狀態槽時列出，附 `{datedKeys, totalObservations, sameSlotGroups}`；`SessionLog` 型別豁免）、`unresolvedMarkers`（**未結案標記**：仍帶 `TODO`/`TBD`/`待確認`/`待驗證`/`待定`/`待補`/`暫定` 的 observation，附 120 字元截斷的 `excerpts`——定案後沒人回頭改的事實會無限期陳舊）、`oversizedEntities`
 
-  `SessionLog` 型別對 `duplicateCandidates` / `journalEntities` / `unresolvedMarkers` **三者皆豁免**：它依設計就是流水帳、`pending` 區塊本來就在列未決事項，三者對它都必然命中，而必然命中的信號不是信號；其體積由區塊保留上限管控。（**超大實體警告**：observation 條數 ≥ 50 或字元總量 ≥ 10,000 的實體，依 `totalChars` 遞減排序，附 `exceeds` 原因——超大 hub 被 search/get 命中一次就回傳大量字元稀釋 context，提示拆分或 prune；僅警告不阻斷）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
+  `SessionLog` 型別對 `duplicateCandidates` / `journalEntities` / `unresolvedMarkers` **三者皆豁免（舊圖譜防禦）**：支配方法學（memory-graph-curation）已於 2026-08-24 廢除 transient SessionLog 層並禁止重建，新圖譜不該再出現它；豁免只為仍存有 SessionLog 實體的舊圖譜保留——它依設計就是流水帳、`pending` 區塊本來就在列未決事項，三者對它都必然命中，而必然命中的信號不是信號。（**超大實體警告**：observation 條數 ≥ 50 或字元總量 ≥ 10,000 的實體，依 `totalChars` 遞減排序，附 `exceeds` 原因——超大 hub 被 search/get 命中一次就回傳大量字元稀釋 context，提示拆分或 prune；僅警告不阻斷）、`stats`（entity/relation/observation 計數與型別分佈）。針對單一資料庫（`context` 或 default）運作
 - `aim_memory_list_entity_types` — 唯讀，回傳各 `entityType` 與其實體計數（數量多者在前），供型別詞彙治理
 - `aim_memory_count_observations` — 唯讀 observation 計數（**不回本文**）：對指定 entities 回傳 `{entityName, entityExists, totalObservations, matched, groups?}`；`observationPrefix` 必填，加 `groupByDelimiter`（如 `｜`）可把命中條目按「開頭到首個分隔符」分組回傳 `[{key, count}]`。回答「entity 內某前綴有幾個分組、各自 key 是什麼」不需全量拉取，是 SessionLog prune 的決策與刪後核實工具
 
@@ -194,7 +194,7 @@ my-project/
 
 - `context`（可選）— 指定命名資料庫（`work`、`personal` 等）。預設為主資料庫
 - `projectRoot`（**`--workspace-only` 下必填**）— 當前 workspace/專案根目錄的絕對路徑，記憶儲存於 `<projectRoot>/.aim/`
-- `location`（可選）— 強制儲存位置。`--workspace-only` 模式下僅接受 `project`，`global` 會被拒絕
+- `location`（可選）— 強制儲存位置。**`--workspace-only` 模式下此屬性從對外 schema 整個移除**（`tools/list` 不再出現，模型不該再傳）；若呼叫端仍傳 `global`，執行期會被儲存層拒絕（最後防線）
 - `format`（可選，讀取類工具）— 輸出格式：`json`（預設，結構化）、`pretty`（人類可讀）、`concise`（token 精簡，單行一實體，最適合回填大模型 context）
 - `limit`（可選，`aim_memory_search`）— 只回傳相關性最高的前 N 個命中實體（seeds）。相關性排序：name 完全命中 > name 子字串 > type > observation。由 `depth` 帶入的鄰居不計入此上限
 - `depth`（可選，`aim_memory_search`，預設 `1`）— 由每個命中實體向外擴展的關係跳數，帶入鄰居提供脈絡。設為 `0` 只回傳命中實體與其之間的關係
@@ -215,6 +215,8 @@ my-project/
 ### 錯誤通道
 
 所有工具層錯誤（缺必填參數、實體不存在、workspace-only 拒絕、無效 context 等）一律以 **`isError: true` 的正常 tools/call 結果**回傳，錯誤訊息放在 `content[].text`——而不是 JSON-RPC 協議級錯誤。這符合 MCP 對工具錯誤的建議通道，讓客戶端把訊息交給模型修正呼叫；部分客戶端會把協議級錯誤誤判為連線故障而殺掉並重啟健康的 server 行程（重連風暴），對模型呈現為「Failed to connect」。
+
+**執行期型別驗證**：工具參數會依對外公告的 `inputSchema` 在執行期驗證（型別／巢狀 required／enum／數值下界）。畸形 payload（例如 `entities` 傳字串）以明確的 `Invalid argument(s)` 訊息拒絕，而不是裸 `TypeError`。
 
 ### 搜尋行為（相關性排序 + ego-graph 擴展）
 

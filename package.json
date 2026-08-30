@@ -4,8 +4,12 @@
   "description": "MCP server enabling persistent memory for AI models through a local knowledge graph",
   "license": "MIT",
   "author": "Shane Holloman",
-  "homepage": "https://github.com/shaneholloman/mcp-knowledge-graph",
-  "bugs": "https://github.com/shaneholloman/mcp-knowledge-graph/issues",
+  "homepage": "https://github.com/lamjack/mcp-knowledge-graph",
+  "bugs": "https://github.com/lamjack/mcp-knowledge-graph/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lamjack/mcp-knowledge-graph.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
