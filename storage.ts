@@ -5,6 +5,8 @@ import { existsSync, statSync } from 'fs';
 import path, { isAbsolute } from 'path';
 import { baseMemoryPath, FILE_MARKER, workspaceOnly as configWorkspaceOnly, AIM_DIR_NAME, DB_FILE_EXT, DB_FILE_PREFIX, MASTER_DB_FILE } from './config.js';
 import { recordDiagnostic } from './diagnostics.js';
+import { searchGraph, type SearchOptions } from './search.js';
+import { auditGraph, excerptOf, keyHeadOf, normalizeTypeKey, type DoctorReport } from './audit.js';
 
 // `context` 值的允許格式。context 會被插入檔名
 // （`memory-${context}.jsonl`），因此絕不能包含路徑分隔符或目錄穿越段。
@@ -238,51 +240,6 @@ export interface ObservationCountResult {
   groups?: { key: string; count: number }[] | undefined;
 }
 
-// aim_memory_doctor 的唯讀審計報告。所有欄位皆為新計算的純資料（不與快取共用參考）。
-export interface DoctorReport {
-  // 無任何 relation 端點的 entity 名單（名稱序）。
-  orphans: string[];
-  // 端點不存在的 relation 清單。
-  danglingRelations: Relation[];
-  // entityType 僅差大小寫/底線/連字符的分組（正規化鍵 -> 原始型別集合）。
-  typeCollisions: { normalized: string; types: string[] }[];
-  // 同一 entity 內共用相同 key 前綴的多條 observations（可能是未清理的過時版本）。
-  // excerpts 截斷至 EXCERPT_MAX_CHARS：合法多值鍵（`service:` × N）與過時版本在此無法區分，
-  // 一律回報但**不逐字回吐**——實測某真實圖譜的 runbook 多值鍵曾讓本區段吃掉單次輸出預算近三成。
-  duplicateCandidates: { entityName: string; keyPrefix: string; count: number; excerpts: string[] }[];
-  // 超大實體警告（advisory）：observation 條數或字元總量達到閾值的實體，依 totalChars 遞減排序。
-  // 超大 hub 實體被 search/get 命中時單次即回傳大量字元，稀釋 context——提示拆分或 prune。
-  oversizedEntities: {
-    entityName: string;
-    observationCount: number;
-    totalChars: number;
-    exceeds: ('observationCount' | 'totalChars')[];
-  }[];
-  // 流水帳漂移：key 頭內嵌日期的 observation 每寫一次就生成一個新鍵，結構上永遠無法被後續
-  // 事實覆蓋，於是實體從「當前狀態」退化為「歷次快照堆積」。兩種命中條件：
-  //   1. datedKeys 達門檻——日期已成為該實體的組織主軸；
-  //   2. sameSlotGroups 非空——多個鍵剝掉日期後指向同一個槽（如 "deploy (2026-08-12)"
-  //      與 "deploy (2026-08-20)"），這類同事重複 duplicateCandidates 全盲，因為每個鍵都相異。
-  // keyPrefixes 可直接餵給 remove_facts 的 observationPrefix 清理。SessionLog 型別豁免。
-  journalEntities: {
-    entityName: string;
-    datedKeys: number;
-    totalObservations: number;
-    sameSlotGroups: { slot: string; count: number; keyPrefixes: string[] }[];
-  }[];
-  // 未結案標記：仍寫著 TODO / 待確認 之類的 observation。它們是「當時沒定案」的事實，
-  // 定案後常沒人回頭改，於是無限期陳舊。excerpts 截斷至 120 字元以控制報告體積。
-  unresolvedMarkers: { entityName: string; count: number; markers: string[]; excerpts: string[] }[];
-  // 計數與型別分佈統計。
-  stats: {
-    database: string;
-    entityCount: number;
-    relationCount: number;
-    observationCount: number;
-    entityTypeDistribution: Record<string, number>;
-  };
-}
-
 // 判斷 `line` 是否為我們的 `_aim` 安全標記。永不拋出例外（無效 JSON -> false）。
 function isMarkerLine(line: string): boolean {
   try {
@@ -351,97 +308,10 @@ export function formatGraphConcise(graph: KnowledgeGraph, context?: string): str
 
 // 搜尋選項：limit 限制 seed 命中數量，depth 控制 ego-graph 擴展跳數。
 // 明確允許 undefined，讓呼叫端可直接透傳未提供的工具參數（exactOptionalPropertyTypes）。
-export interface SearchOptions {
-  limit?: number | undefined;
-  depth?: number | undefined;
-}
-
 // 關係的唯一鍵：以 NUL 分隔 from/relationType/to，避免值中含分隔字元造成碰撞。
 // 用於以 Set 做 O(1) 的關係去重與刪除，取代嵌套線性掃描。
 function relationKey(r: Relation): string {
   return `${r.from}\u0000${r.relationType}\u0000${r.to}`;
-}
-
-// entityType 正規化鍵：小寫並移除底線/連字符，用於偵測「僅差大小寫/底線/連字符」的近似重複型別
-// （如 DevPlan / dev-plan / dev_plan 皆正規化為 devplan）。純比較用途，不改變儲存的原始型別字串。
-function normalizeTypeKey(entityType: string): string {
-  return entityType.toLowerCase().replace(/[_-]/g, '');
-}
-
-// 超大實體閾值（達標即列入 doctor 的 oversizedEntities，僅警告不阻斷）。
-// 依據：預設輸出上限 50,000 字元下，單一實體 10k 字元已佔單次回傳預算兩成，
-// 被 search/get 命中一次就大幅稀釋 context；50 條 observation 遠超正常策展粒度
-// （如 SessionLog 10 區塊約 30 條），是「該拆分或 prune 的 hub」的可靠信號。
-const OVERSIZED_OBSERVATION_COUNT = 50;
-const OVERSIZED_TOTAL_CHARS = 10_000;
-
-// observation 的 key 頭：首個 ':' 或全形 '：' 之前的片段（已 trim）。半形與全形一律
-// 視為分隔符——中文書寫常用全形，只認半形會讓「別名：a / 別名：b」這類真重複永遠漏檢。
-// 無分隔符、以分隔符開頭、或 key 頭為空者回 undefined（視為無鍵 observation）。
-export function keyHeadOf(observation: string): string | undefined {
-  const half = observation.indexOf(':');
-  const full = observation.indexOf('：');
-  const idx = half < 0 ? full : full < 0 ? half : Math.min(half, full);
-  if (idx <= 0) return undefined;
-  const head = observation.slice(0, idx).trim();
-  return head === '' ? undefined : head;
-}
-
-// key 頭中的日期。鍵一旦帶日期就每寫一次生成一個新鍵，後續事實在結構上永遠無法覆蓋它
-// ——這正是 journalEntities 要抓的形態。
-// ⚠️ 只認四位年份 + `-` 或 `/` 分隔的完整日期（2026-08-12 / 2026/8/12）。兩次收緊都是被
-// 誤報逼出來的：先放寬到 08-12 短式，把版本號 v3000.4.25 的 "4.25" 當成日期；改成強制
-// 四位年份後 "3000.4.25" 整串仍完全符合 \d{4}.\d{1,2}.\d{1,2}——點分版本號與點分日期在
-// 結構上無法區分。點號因此排除。誤報會讓整個區段被無視，寧可漏掉 2026.08.12 這種寫法
-// （實測兩個真實圖譜清一色用連字號）也不要污染信號。
-const DATE_PATTERN = String.raw`\d{4}[-/]\d{1,2}[-/]\d{1,2}`;
-const DATE_IN_KEY = new RegExp(DATE_PATTERN);
-// 內含日期的括號整組（半形/全形/方括號）。整組剝除才能讓
-// 「staging deploy (2026-08-20, second run)」與「staging deploy (2026-08-12)」歸為同槽。
-const DATED_BRACKET = new RegExp(String.raw`[（(【[][^）)】\]]*${DATE_PATTERN}[^）)】\]]*[）)】\]]?`, 'g');
-
-// 由帶日期的 key 頭反推它真正描述的「狀態槽」：剝掉帶日期的括號組與裸日期後剩下的語意。
-// 只對帶日期的 key 呼叫（見 doctor），因此不會把 service: a / service: b 這類合法多值鍵誤併。
-export function slotOfDatedKey(keyHead: string): string {
-  return keyHead
-    .replace(DATED_BRACKET, ' ')
-    .replace(new RegExp(DATE_PATTERN, 'g'), ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^[，,、\-—:：]+|[，,、\-—:：]+$/g, '')
-    .trim();
-}
-
-// 三種陳舊/重複偵測（duplicateCandidates / journalEntities / unresolvedMarkers）皆不適用的
-// entityType（正規化比較）。SessionLog 依設計就是帶時序的流水帳且 pending 區塊本來就在列
-// 未決事項，三者對它都是必然命中；必然命中的信號不是信號，只會淹沒真正的問題。
-// 它的體積與收斂由區塊保留上限（與 prune 時的 pending 處理）負責，不由本審計負責。
-const AUDIT_EXEMPT_TYPES = new Set(['sessionlog']);
-
-// 單一實體內帶日期 key 的數量門檻與佔比門檻，須同時達標。數量濾掉零星標註
-// （在鍵裡順手記個日期）；佔比濾掉「本來就長」的實體——96 條裡有 12 條帶日期屬正常，
-// 34 條裡有 30 條才是日期已成為組織主軸。兩者缺一就會製造警報疲勞，讓真信號被淹沒。
-const JOURNAL_DATED_KEY_THRESHOLD = 5;
-const JOURNAL_DATED_KEY_RATIO = 0.3;
-
-// 未結案標記：出現在 observation 中即代表該事實仍是暫定/待辦，需要在後續 session 回頭收斂。
-// 刻意維持精簡且無歧義——寧可漏報也不要讓一般敘述（如「尚未實作」這類穩定現狀）洗版。
-const UNRESOLVED_MARKERS = ['TODO', 'TBD', '待確認', '待驗證', '待定', '待補', '暫定'];
-const EXCERPT_MAX_CHARS = 120;
-// 每組最多取樣幾條摘錄。判斷「這組是合法多值還是同事實的多版本」三條足矣，
-// 而 `count` 已如實回報組員總數；9 條全吐只是把預算花在重複資訊上。
-const EXCERPT_SAMPLE_LIMIT = 3;
-
-// 報告用摘錄：超長 observation 截斷並標記，避免審計區段吃掉單次輸出預算。
-function excerptOf(observation: string): string {
-  return observation.length > EXCERPT_MAX_CHARS
-    ? `${observation.slice(0, EXCERPT_MAX_CHARS)}…`
-    : observation;
-}
-
-// 取樣並截斷一組 observation，供審計報告使用（順序保留，取前 N 條）。
-function excerptsOf(observations: string[]): string[] {
-  return observations.slice(0, EXCERPT_SAMPLE_LIMIT).map(excerptOf);
 }
 
 // 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
@@ -470,69 +340,6 @@ function detectEntityTypeWarnings(existingTypes: Iterable<string>, newEntities: 
     }
   }
   return warnings;
-}
-
-// 是否為「詞字元」（unicode 字母或數字）。底線與空白/標點皆視為詞邊界，
-// 因此 snake_case 的各段會被當成獨立詞（與 JS \b 的差異：\b 視底線為詞字元）。
-function isWordChar(ch: string): boolean {
-  return /[\p{L}\p{N}]/u.test(ch);
-}
-
-// 判斷 term 是否以「整詞」形式出現在 haystack（兩側為字串邊界或非詞字元）。
-// 用於搜尋的 word-boundary 權重：整詞命中優先於中段子字串命中。兩者皆為小寫。
-function includesWholeWord(haystack: string, term: string): boolean {
-  if (term.length === 0) return false;
-  let idx = haystack.indexOf(term);
-  while (idx !== -1) {
-    const before = idx === 0 ? '' : haystack[idx - 1]!;
-    const afterIdx = idx + term.length;
-    const after = afterIdx >= haystack.length ? '' : haystack[afterIdx]!;
-    const boundaryBefore = before === '' || !isWordChar(before);
-    const boundaryAfter = after === '' || !isWordChar(after);
-    if (boundaryBefore && boundaryAfter) return true;
-    idx = haystack.indexOf(term, idx + 1);
-  }
-  return false;
-}
-
-// 以非詞字元切分為 token（unicode 友善）。用於查詢分詞，以及 fuzzy 比對時將實體文字 token 化。
-function tokenizeWords(s: string): string[] {
-  return s.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-}
-
-// 受限編輯距離（Levenshtein）：一旦確定距離 > max 即提早回傳 max+1，避免不必要的計算。
-// 用於 typo 容忍的近似比對（僅在查詢詞無精確命中時作為 fallback 觸發）。
-// 匯出供 server 層的「工具名／參數名 did-you-mean」重用：同一套距離語義，零新依賴。
-export function boundedLevenshtein(a: string, b: string, max: number): number {
-  const la = a.length;
-  const lb = b.length;
-  if (Math.abs(la - lb) > max) return max + 1;
-  let prev = new Array<number>(lb + 1);
-  for (let j = 0; j <= lb; j++) prev[j] = j;
-  for (let i = 1; i <= la; i++) {
-    const curr = new Array<number>(lb + 1);
-    curr[0] = i;
-    let rowMin = curr[0];
-    const ai = a[i - 1];
-    for (let j = 1; j <= lb; j++) {
-      const cost = ai === b[j - 1] ? 0 : 1;
-      const v = Math.min(prev[j]! + 1, curr[j - 1]! + 1, prev[j - 1]! + cost);
-      curr[j] = v;
-      if (v < rowMin) rowMin = v;
-    }
-    if (rowMin > max) return max + 1;
-    prev = curr;
-  }
-  const d = prev[lb]!;
-  return d <= max ? d : max + 1;
-}
-
-// 將來自 client 的數值輸入正規化為非負整數：有限數 → 取下限 0 的整數；
-// 其餘（未提供/NaN/Infinity/非數值）→ undefined，由各呼叫端套用自己的預設值
-// （offset 預設 0、limit 不設上限、depth 預設 1）。此語義曾分散三處、靠註釋維持同步，
-// 單一出口後由 server.ts（read_all 分頁）與本檔 searchNodes（limit/depth）共用。
-export function normalizeNonNegInt(raw: unknown): number | undefined {
-  return (typeof raw === 'number' && Number.isFinite(raw)) ? Math.max(0, Math.floor(raw)) : undefined;
 }
 
 // KnowledgeGraphManager 類別包含所有與知識圖譜互動的操作
@@ -949,176 +756,11 @@ export class KnowledgeGraphManager {
     return this.loadGraph(this.resolvePath(context, location, projectRoot));
   }
 
-  // 相關性排序搜尋 + ego-graph 擴展。
-  // 1) 對每個實體評分（name 完全命中 > name 子字串 > type 子字串 > observation 命中）；
-  //    多詞查詢額外以 IDF 加權（降權通用詞、升權稀有詞）並對 observation 命中做長度正規化。
-  // 2) 依分數排序取 top-k（limit）作為 seeds。
-  // 3) 由 seeds 依 depth 跳數擴展鄰居（預設 1），讓命中的關係與脈絡不被丟棄。
-  // 回傳的實體以「seeds（相關性序）在前、鄰居（名稱序）在後」排列，關係僅保留兩端皆在結果集者。
+  // 相關性排序搜尋 + ego-graph 擴展。引擎已抽至 search.ts 的 searchGraph（純函式模組，
+  // 評分/擴展的語義註釋隨引擎一併搬遷）；此方法只做路徑解析與共享快取讀取，行為不變。
   async searchNodes(query: string, context?: string, location?: 'project' | 'global', projectRoot?: string, options?: SearchOptions): Promise<KnowledgeGraph> {
     const graph = await this.loadGraphShared(this.resolvePath(context, location, projectRoot));
-    const qFull = query.toLowerCase();
-    // 分詞：以非詞字元切分（unicode 友善）並去重。單詞查詢維持原有分層契約；
-    // 多詞查詢額外啟用逐詞比對 + 詞覆蓋 + 整詞（word-boundary）權重 + IDF 加權，提升 recall 與精準度。
-    const terms = Array.from(new Set(tokenizeWords(qFull)));
-
-    // 預先小寫化各欄位一次（供 DF 統計與評分共用，避免每個實體重複轉換）。
-    const docs = graph.entities.map(e => ({
-      e,
-      name: e.name.toLowerCase(),
-      type: e.entityType.toLowerCase(),
-      obs: e.observations.map(o => o.toLowerCase()),
-    }));
-    const N = docs.length;
-
-    // Document frequency：每個 term 出現於多少實體（name/type/任一 obs 含該子字串）。
-    // 供 IDF 與 fuzzy 門檻共用。
-    const df = new Map<string, number>();
-    for (const t of terms) {
-      let c = 0;
-      for (const d of docs) {
-        if (d.name.includes(t) || d.type.includes(t) || d.obs.some(o => o.includes(t))) c++;
-      }
-      df.set(t, c);
-    }
-
-    // IDF：add-one 平滑（idf = 1 + ln((N+1)/(df+1))，恆 >= 1）：稀有詞被放大、通用詞回歸基準 1。
-    // 單一 term 對所有實體是等倍率、不改變相對排序，故僅在多詞查詢時套用。
-    const idf = new Map<string, number>();
-    if (terms.length >= 2) {
-      for (const t of terms) idf.set(t, 1 + Math.log((N + 1) / ((df.get(t) ?? 0) + 1)));
-    }
-
-    // Fuzzy fallback（typo 容忍）：僅對「語料中無任何精確子字串命中（df=0）」且長度 >= 4 的 term 啟用，
-    // 避免對已可精確命中者引入雜訊，並把昂貴的編輯距離限制在真的需要時才計算。
-    const FUZZY_MIN_LEN = 4;
-    const fuzzyTerms = terms.filter(t => t.length >= FUZZY_MIN_LEN && (df.get(t) ?? 0) === 0);
-    const needFuzzy = fuzzyTerms.length > 0;
-    // 需要時才把各實體文字切成 token 集（name + type + observations），供近似比對。
-    const docTokens: Set<string>[] = needFuzzy
-      ? docs.map(d => {
-          const toks = new Set<string>();
-          for (const w of tokenizeWords(d.name)) toks.add(w);
-          for (const w of tokenizeWords(d.type)) toks.add(w);
-          for (const o of d.obs) for (const w of tokenizeWords(o)) toks.add(w);
-          return toks;
-        })
-      : [];
-
-    const scoreOf = (d: { name: string; type: string; obs: string[] }, i: number): number => {
-      const { name, type, obs } = d;
-      // 長度正規化：observation 越多的實體，單則命中的邊際貢獻越低，抑制長 hub 靠「數量」霸榜。
-      // <=1 則 observation 時係數為 1（不影響短實體），observation 越多係數越小。
-      const obsNorm = 1 / (1 + Math.log(1 + Math.max(0, obs.length - 1)));
-
-      let score = 0;
-      // 片語層（整條查詢當單一子字串）：完整保留單詞查詢的既有分層（100/10/5/1）。
-      if (name === qFull) score += 100;
-      else if (name.includes(qFull)) score += 10;
-      if (type.includes(qFull)) score += 5;
-      let phraseObsHits = 0;
-      for (const o of obs) if (o.includes(qFull)) phraseObsHits++;
-      score += phraseObsHits * obsNorm;
-
-      // 多詞增益：僅當 >=2 詞時啟用（單詞查詢行為與排序完全不變）。逐詞貢獻以 IDF 加權。
-      if (terms.length >= 2) {
-        let matchedTerms = 0;
-        for (const t of terms) {
-          let contribution = 0;
-          if (name.includes(t)) contribution += includesWholeWord(name, t) ? 10 : 5;
-          if (type.includes(t)) contribution += includesWholeWord(type, t) ? 4 : 2;
-          let obsHit = 0;
-          for (const o of obs) {
-            if (o.includes(t)) obsHit += includesWholeWord(o, t) ? 1 : 0.5;
-          }
-          contribution += obsHit * obsNorm;
-          if (contribution > 0) matchedTerms++;
-          score += contribution * (idf.get(t) ?? 1);
-        }
-        // 詞覆蓋獎勵：命中越多不同查詢詞越相關，讓多詞命中者排在單詞命中者之上。
-        if (matchedTerms >= 2) score += matchedTerms * 3;
-      }
-
-      // Fuzzy fallback：對 df=0 的長 term，若實體有 token 落在小編輯距離內給溫和加分（補 typo/近似）。
-      // 距離門檻依 term 長度（>=7 允許 2 個編輯，否則 1 個），並以長度差先行剪枝。
-      if (needFuzzy) {
-        const toks = docTokens[i]!;
-        for (const t of fuzzyTerms) {
-          const maxEdits = t.length >= 7 ? 2 : 1;
-          for (const tok of toks) {
-            if (Math.abs(tok.length - t.length) > maxEdits) continue;
-            if (boundedLevenshtein(tok, t, maxEdits) <= maxEdits) {
-              score += 4;
-              break;
-            }
-          }
-        }
-      }
-      return score;
-    };
-
-    // seeds：命中（score > 0）者依分數遞減排序，同分以名稱穩定排序。
-    const scored = docs
-      .map((d, i) => ({ e: d.e, score: scoreOf(d, i) }))
-      .filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score || a.e.name.localeCompare(b.e.name));
-
-    // limit：負值視為 0（回空結果）；未提供/NaN/Infinity → undefined = 不設上限。
-    const limit = normalizeNonNegInt(options?.limit);
-    const seeds = (limit !== undefined) ? scored.slice(0, limit) : scored;
-    const seedNames = seeds.map(s => s.e.name);
-    const seedSet = new Set(seedNames);
-
-    // ego-graph 擴展：由 seeds 出發，逐層（BFS）納入 depth 跳內的鄰居。
-    // depth：未提供/NaN/Infinity → 預設 1。
-    const depth = normalizeNonNegInt(options?.depth) ?? 1;
-    // 鄰接表：每跳只走前沿節點的邊（O(觸及邊數）），取代每跳掃全部關係的 O(depth·R)。
-    const adjacency = new Map<string, string[]>();
-    const addAdj = (a: string, b: string) => {
-      const list = adjacency.get(a);
-      if (list) list.push(b);
-      else adjacency.set(a, [b]);
-    };
-    for (const r of graph.relations) {
-      addAdj(r.from, r.to);
-      addAdj(r.to, r.from);
-    }
-    const included = new Set<string>(seedNames);
-    let frontier: string[] = seedNames;
-    for (let d = 0; d < depth; d++) {
-      const next: string[] = [];
-      for (const node of frontier) {
-        const neighbours = adjacency.get(node);
-        if (!neighbours) continue;
-        for (const nb of neighbours) {
-          if (!included.has(nb)) {
-            included.add(nb);
-            next.push(nb);
-          }
-        }
-      }
-      if (next.length === 0) break;
-      frontier = next;
-    }
-
-    // 組裝實體：seeds（相關性序）在前，鄰居（名稱序）在後。
-    const byName = new Map(graph.entities.map(e => [e.name, e] as const));
-    const neighbourNames = [...included].filter(n => !seedSet.has(n)).sort((a, b) => a.localeCompare(b));
-    const entities: Entity[] = [];
-    for (const n of seedNames) {
-      const e = byName.get(n);
-      if (e) entities.push(e);
-    }
-    for (const n of neighbourNames) {
-      const e = byName.get(n);
-      if (e) entities.push(e);
-    }
-
-    // 關係：僅保留兩端皆在結果集者（此時已因擴展而連貫）。
-    const relations = graph.relations.filter(r => included.has(r.from) && included.has(r.to));
-
-    // 因使用共享快取參考，需深拷貝回傳的子圖，避免呼叫端透過回傳值污染快取。
-    return structuredClone({ entities, relations });
+    return searchGraph(graph, query, options);
   }
 
   async openNodes(names: string[], context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<KnowledgeGraph> {
@@ -1217,165 +859,11 @@ export class KnowledgeGraphManager {
     });
   }
 
-  // 唯讀圖譜審計：孤兒實體、懸空關係、entityType 格式碰撞、同 key 前綴的重複候選 observations、
-  // 以及計數/型別分佈統計。針對單一資料庫（context 或 default）運作，與其他工具的 per-context 設計一致。
+  // 唯讀圖譜審計。引擎已抽至 audit.ts 的 auditGraph（純函式模組，各偵測區段的語義註釋
+  // 隨引擎一併搬遷）；此方法只做路徑解析與共享快取讀取，行為不變。
   async doctor(context?: string, location?: 'project' | 'global', projectRoot?: string): Promise<DoctorReport> {
     const graph = await this.loadGraphShared(this.resolvePath(context, location, projectRoot));
-    const names = new Set(graph.entities.map(e => e.name));
-
-    // orphans：不作為任何 relation 端點的 entity。
-    const connected = new Set<string>();
-    for (const r of graph.relations) {
-      connected.add(r.from);
-      connected.add(r.to);
-    }
-    const orphans = graph.entities
-      .filter(e => !connected.has(e.name))
-      .map(e => e.name)
-      .sort((a, b) => a.localeCompare(b));
-
-    // danglingRelations：任一端點不存在於實體集合。
-    const danglingRelations = graph.relations
-      .filter(r => !names.has(r.from) || !names.has(r.to))
-      .map(r => ({ from: r.from, relationType: r.relationType, to: r.to }));
-
-    // typeCollisions：正規化鍵相同但原字串多於一種的分組。
-    const byNorm = new Map<string, Set<string>>();
-    for (const e of graph.entities) {
-      const k = normalizeTypeKey(e.entityType);
-      const set = byNorm.get(k);
-      if (set) set.add(e.entityType);
-      else byNorm.set(k, new Set([e.entityType]));
-    }
-    const typeCollisions = [...byNorm.entries()]
-      .filter(([, set]) => set.size >= 2)
-      .map(([normalized, set]) => ({ normalized, types: [...set].sort((a, b) => a.localeCompare(b)) }))
-      .sort((a, b) => a.normalized.localeCompare(b.normalized));
-
-    // duplicateCandidates：同一 entity 內共用相同 key 前綴的多條 observations。
-    // journalEntities：帶日期的 key 頭另按「剝掉日期後的狀態槽」分組，並統計每個實體的
-    // 帶日期鍵總數——日期入鍵者結構上不可被覆蓋，累積到一定量即代表該實體已淪為流水帳。
-    const duplicateCandidates: DoctorReport['duplicateCandidates'] = [];
-    const journalEntities: DoctorReport['journalEntities'] = [];
-    for (const e of graph.entities) {
-      const groups = new Map<string, string[]>();
-      const slots = new Map<string, { keys: Set<string>; count: number }>();
-      // SessionLog 對兩種偵測都豁免。duplicateCandidates 在它身上是結構性假陽性：
-      // `session <ts>｜…` 的首個 ':' 落在 ISO 時間戳裡，同一小時的區塊因而歸為同鍵，
-      // 而它們是相異的工作紀錄不是同一事實的版本；照報還會把整批長文吐進報告淹掉真信號。
-      const auditExempt = AUDIT_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType));
-      let datedKeys = 0;
-      for (const o of e.observations) {
-        const prefix = keyHeadOf(o);
-        if (prefix === undefined) continue; // 無鍵 observation 不參與任何分組。
-        if (auditExempt) continue;
-        const arr = groups.get(prefix);
-        if (arr) arr.push(o);
-        else groups.set(prefix, [o]);
-        if (!DATE_IN_KEY.test(prefix)) continue;
-        datedKeys += 1;
-        const slot = slotOfDatedKey(prefix);
-        const bucket = slots.get(slot);
-        if (bucket) {
-          bucket.keys.add(prefix);
-          bucket.count += 1;
-        } else {
-          slots.set(slot, { keys: new Set([prefix]), count: 1 });
-        }
-      }
-      for (const [keyPrefix, obs] of groups) {
-        if (obs.length >= 2) {
-          duplicateCandidates.push({ entityName: e.name, keyPrefix, count: obs.length, excerpts: excerptsOf(obs) });
-        }
-      }
-      // 同槽需至少兩個相異鍵；同一個鍵重複多次屬 duplicateCandidates 的範疇，兩者不重複回報。
-      const sameSlotGroups = [...slots.entries()]
-        .filter(([, { keys }]) => keys.size >= 2)
-        .map(([slot, { keys, count }]) => ({
-          slot,
-          count,
-          keyPrefixes: [...keys].sort((a, b) => a.localeCompare(b)),
-        }))
-        .sort((a, b) => b.count - a.count || a.slot.localeCompare(b.slot));
-      // 同槽重複是精確證據，不受數量/佔比門檻約束，一律回報。
-      const drifted =
-        datedKeys >= JOURNAL_DATED_KEY_THRESHOLD &&
-        datedKeys >= e.observations.length * JOURNAL_DATED_KEY_RATIO;
-      if (drifted || sameSlotGroups.length > 0) {
-        journalEntities.push({
-          entityName: e.name,
-          datedKeys,
-          totalObservations: e.observations.length,
-          sameSlotGroups,
-        });
-      }
-    }
-    duplicateCandidates.sort((a, b) => a.entityName.localeCompare(b.entityName) || a.keyPrefix.localeCompare(b.keyPrefix));
-    journalEntities.sort((a, b) => b.datedKeys - a.datedKeys || a.entityName.localeCompare(b.entityName));
-
-    // unresolvedMarkers：仍帶未結案標記的 observation，依 entity 匯總。
-    // SessionLog 同樣豁免：`pending:` 區塊本來就在列未決事項，每個 session 必然命中——
-    // 必然命中的信號不是信號。它的收斂由區塊保留上限與 prune 時的 pending 處理負責。
-    const unresolvedMarkers: DoctorReport['unresolvedMarkers'] = [];
-    for (const e of graph.entities) {
-      if (AUDIT_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType))) continue;
-      const markers = new Set<string>();
-      const hits: string[] = [];
-      for (const o of e.observations) {
-        const matched = UNRESOLVED_MARKERS.filter(m => o.includes(m));
-        if (matched.length === 0) continue;
-        for (const m of matched) markers.add(m);
-        hits.push(o);
-      }
-      if (hits.length > 0) {
-        unresolvedMarkers.push({
-          entityName: e.name,
-          count: hits.length,
-          markers: [...markers].sort((a, b) => a.localeCompare(b)),
-          excerpts: excerptsOf(hits),
-        });
-      }
-    }
-    unresolvedMarkers.sort((a, b) => b.count - a.count || a.entityName.localeCompare(b.entityName));
-
-    // oversizedEntities：observation 條數或字元總量達閾值的實體（提示拆分/prune 的策展信號）。
-    // 依 totalChars 遞減排序（最重的 hub 在前），同量以名稱穩定排序。
-    const oversizedEntities: DoctorReport['oversizedEntities'] = [];
-    for (const e of graph.entities) {
-      const totalChars = e.observations.reduce((sum, o) => sum + o.length, 0);
-      const exceeds: ('observationCount' | 'totalChars')[] = [];
-      if (e.observations.length >= OVERSIZED_OBSERVATION_COUNT) exceeds.push('observationCount');
-      if (totalChars >= OVERSIZED_TOTAL_CHARS) exceeds.push('totalChars');
-      if (exceeds.length > 0) {
-        oversizedEntities.push({ entityName: e.name, observationCount: e.observations.length, totalChars, exceeds });
-      }
-    }
-    oversizedEntities.sort((a, b) => b.totalChars - a.totalChars || a.entityName.localeCompare(b.entityName));
-
-    // stats：計數與型別分佈。
-    const entityTypeDistribution: Record<string, number> = {};
-    let observationCount = 0;
-    for (const e of graph.entities) {
-      entityTypeDistribution[e.entityType] = (entityTypeDistribution[e.entityType] ?? 0) + 1;
-      observationCount += e.observations.length;
-    }
-
-    return {
-      orphans,
-      danglingRelations,
-      typeCollisions,
-      duplicateCandidates,
-      oversizedEntities,
-      journalEntities,
-      unresolvedMarkers,
-      stats: {
-        database: context || 'default',
-        entityCount: graph.entities.length,
-        relationCount: graph.relations.length,
-        observationCount,
-        entityTypeDistribution,
-      },
-    };
+    return auditGraph(graph, context || 'default');
   }
 
   // 唯讀：回傳各 entityType 與其實體計數，數量多者在前（同數以名稱排序）。

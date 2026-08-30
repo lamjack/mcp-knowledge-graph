@@ -70,14 +70,17 @@ dist/
 
 ## 架構入口
 
-系統由四個模組組成，各司其職：
+模組職責一覽（皆在 repo 根目錄）：
 
 | 檔案　　　　 | 用途　　　　　　　　　　　　　　　　　　　　　　　　　　 |
 | --------------| ----------------------------------------------------------|
 | `config.ts`　| CLI 參數解析、基底記憶路徑、檔案標記定義　　　　　　　　 |
-| `storage.ts` | 路徑安全檢查、記憶檔案解析、知識圖譜資料模型與持久化操作 |
-| `tools.ts`　 | MCP 工具 schema 定義　　　　　　　　　　　　　　　　　　 |
-| `server.ts`　| 伺服器實例、請求處理器與 `main()` 進入點　　　　　　　　 |
+| `diagnostics.ts` | 診斷紀錄單一出口（Asia/Macau 時間戳、stderr、可選檔案 sink），供 server 拒絕路徑與 storage 損壞行紀錄共用 |
+| `storage.ts` | 路徑安全檢查、記憶檔案解析（JSONL）、知識圖譜資料模型、KnowledgeGraphManager（CRUD、原子寫入、讀取快取）；搜尋/審計委派給下列兩個模組 |
+| `search.ts`　| 搜尋引擎（相關性評分 + ego-graph 擴展，純函式 `searchGraph`） |
+| `audit.ts`　 | doctor 審計引擎（純函式 `auditGraph` + 門檻/豁免常量 + key 頭分析 helpers） |
+| `tools.ts`　 | MCP 工具 schema 定義（含 workspace-only 後處理與名稱 alias 表） |
+| `server.ts`　| 伺服器實例、請求處理器（工具派發表 `TOOL_HANDLERS`）、輸出格式化/分頁/截斷、`main()` |
 | `index.ts`　 | 套件進入點（bin target），匯入並啟動 `server.ts`　　　　 |
 
 ### 儲存邏輯

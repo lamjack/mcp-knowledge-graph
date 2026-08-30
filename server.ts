@@ -18,8 +18,6 @@ import {
   knowledgeGraphManager,
   formatGraphPretty,
   formatGraphConcise,
-  boundedLevenshtein,
-  normalizeNonNegInt,
   findProjectRoot,
   PROJECT_ROOT_REQUIRED_MESSAGE,
   type KnowledgeGraph,
@@ -27,6 +25,7 @@ import {
   type Relation,
   type DeleteObservationsEntry,
 } from './storage.js';
+import { boundedLevenshtein, normalizeNonNegInt } from './search.js';
 import { TOOL_DEFINITIONS, TOOL_NAME_ALIASES, PARAM_ALIASES } from './tools.js';
 
 // 依 format 參數序列化圖譜。'concise' 為 token 精簡格式，'pretty' 為人類可讀，

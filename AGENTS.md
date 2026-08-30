@@ -4,12 +4,14 @@
 
 MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供本地知識圖譜持久記憶（entities / relations / observations），TypeScript + Node.js 22+，`@modelcontextprotocol/sdk` over stdio。以 `--workspace-only` 嚴格模式執行時，記憶物理隔離在每個 workspace 的 `<projectRoot>/.aim/*.jsonl`，所有工具呼叫必帶 `projectRoot`。
 
-四模組架構（全部位於 repo 根目錄）：
+模組架構（全部位於 repo 根目錄；刻意不標數字——清單會演進，數字會漂移）：
 
 - `config.ts` — CLI 參數（minimist）、基底記憶路徑、`_aim` 檔案標記、`maxOutputChars`
 - `diagnostics.ts` — 診斷紀錄的單一出口：Asia/Macau 時間戳、stderr 行、可選檔案 sink。**server 的拒絕路徑與 storage 的損壞行紀錄共用它**（兩層各寫一份會讓格式與 sink 目標漂移，而事後對拍靠的正是格式一致）；只依賴 config，故兩層都能匯入而不成環
-- `storage.ts` — 路徑安全、JSONL 解析、KnowledgeGraphManager（CRUD + 搜尋 + 健檢）、mtime+size 讀取快取（回傳深拷貝）
-- `tools.ts` — MCP 工具 schema 與給模型看的工具描述
+- `storage.ts` — 路徑安全、JSONL 解析、KnowledgeGraphManager（CRUD + 原子寫入 + mtime+size 讀取快取，回傳深拷貝）。搜尋與審計引擎 2026-08-30 抽出為獨立模組（god module 拆分，MB-01），此檔的 `searchNodes`／`doctor` 只剩路徑解析 + 讀取 + 委派
+- `search.ts` — 搜尋引擎純函式：`searchGraph`（相關性評分 + ego-graph 擴展）、`normalizeNonNegInt`、`boundedLevenshtein`（server 的 did-you-mean 也重用）。只 `import type` 依賴 storage，執行期無環
+- `audit.ts` — doctor 審計引擎：`auditGraph` + 門檻/豁免/摘錄常量 + `keyHeadOf`／`normalizeTypeKey`／`slotOfDatedKey`。`keyHeadOf` 與 `normalizeTypeKey` 同時服務 storage 的寫入路徑（upsertKeyed、entityType 碰撞警告），依賴方向是 storage → audit；本模組只 `import type` 依賴 storage，執行期無環
+- `tools.ts` — MCP 工具 schema、給模型看的工具描述、工具/參數名稱 alias 表（`TOOL_NAME_ALIASES`／`PARAM_ALIASES`）
 - `server.ts` — stdio 伺服器接線、工具派發表（`TOOL_HANDLERS`，取代原 15-case switch）、輸出格式化 / 分頁 / 截斷、工具錯誤通道（isError）
 - `index.ts` — bin 進入點
 
@@ -42,7 +44,7 @@ MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供
 - **`store` 對已存在實體是 no-op，但必須有聲**：名稱已存在者被跳過、observations 整批丟棄。過去回傳空陣列且無任何提示——呼叫端看起來像寫入成功，事實卻從未落地，舊事實因而繼續被當成現況召回（**本 repo 消滅靜默失敗的最後一個缺口**，2026-08-21 補上 warning 並改為 0 新增時不寫檔）
 - **「0 變更不寫檔」是全部七條變更路徑的不變式**：`store`／`link`／`add_facts`／`forget`／`remove_facts`／`unlink`／`replace_fact` 在實際無任何變更時不觸碰記憶檔——多行程共用同一 JSONL 下，無謂寫入會 bump mtime 使其他行程快取全失效並擴大 lost-update 窗口。2026-08-30 補齊 `link`／`add_facts`／`forget`／`unlink` 四條（此前僅 `store`／`remove_facts`／`replace_fact` 有守衛），由 test/storage.test.ts 的四個 mtime 守衛測試鎖定
 - **Tool annotations**：15 個工具全部帶 `readOnlyHint`／`destructiveHint`／`idempotentHint`／`openWorldHint:false`（7 唯讀／3 純附加／5 破壞性；`update_entity` 因 rename 不可重放而 `idempotentHint:false`）。分類由 tool-contract 測試逐工具鎖定；tools.ts 尾段的 workspace-only 後處理只碰 `inputSchema`／`description`，不得剝除 `annotations`（有 stdio 守衛）
-- **key 頭定義（跨工具共用）**：observation 的 key 頭是首個 `:` **或全形 `：`** 之前的片段（trim 後非空）。`duplicateCandidates`、`journalEntities`、`add_facts` 的 `upsertKeyed` 共用 `keyHeadOf`；只認半形會讓中文書寫的「別名：a／別名：b」永遠漏檢
+- **key 頭定義（跨工具共用）**：observation 的 key 頭是首個 `:` **或全形 `：`** 之前的片段（trim 後非空）。`duplicateCandidates`、`journalEntities`、`add_facts` 的 `upsertKeyed` 共用 `keyHeadOf`（2026-08-30 起定義在 audit.ts，storage 匯入）；只認半形會讓中文書寫的「別名：a／別名：b」永遠漏檢
 - **`add_facts` 的 upsert 語義**：預設純追加（去重）；entry 帶 `upsertKeyed:true` 時，其 `key: value` 內容先刪掉該 entity 上同 key 頭的既有 observation 再追加，回傳另附 `replacedObservations`。**刻意 opt-in 不自動判斷**——實測真實圖譜中 `service: a`／`service: b` 這類合法多值鍵普遍存在，自動覆蓋會靜默刪除兄弟條目
 - **`doctor` 的陳舊偵測**：`journalEntities` 抓「日期寫進 key 頭」造成的流水帳漂移（每寫一次生成新鍵 → 結構上不可被覆蓋 → 舊快照永久堆積且無工具看得見）。命中條件為帶日期鍵 ≥ 5 **且** 佔比 ≥ 30%，或存在剝掉日期後同槽的多個相異鍵；兩道門檻缺一就會製造警報疲勞（僅數量門檻會把「96 條裡 12 條帶日期」的正常長實體也報進來）。`unresolvedMarkers` 抓仍帶 `TODO`/`待確認` 類標記的 observation。**`SessionLog` 對三者（`duplicateCandidates` / `journalEntities` / `unresolvedMarkers`）皆豁免**（`AUDIT_EXEMPT_TYPES`）：duplicateCandidates 在它身上是結構性假陽性（`session <ts>｜…` 的首個 `:` 落在 ISO 時間戳內，同小時區塊歸為同鍵）、`pending` 區塊本來就在列未決事項必然命中 unresolvedMarkers——**必然命中的信號不是信號**，其體積與收斂由區塊保留上限負責
 - **審計區段一律只回 `excerpts`（每組取樣 ≤ 3 條、各截斷 120 字元），`count` 保持精確，不逐字回吐 observation**：合法多值鍵（`service:` × 9、`known_pitfall:` × 8）與過時版本在引擎層無法區分，必須一律回報；判斷是哪一種三條摘錄已足夠，全吐只是把預算花在重複資訊上。實測某真實圖譜 doctor 報告因此從 14.5K 降到 8.3K 字元。需要全文時走 `get({names, observationPrefix})`。**設計前提是 doctor 會在每次 recall 被呼叫**（skill 端已如此規定），所以報告體積本身是契約的一部分
@@ -60,7 +62,7 @@ MCP knowledge-graph server（`mcp-knowledge-graph` fork）：為 AI 模型提供
 
 ## 已知坑
 
-- **⚠️ 拒絕的主因是呼叫端用錯名稱，不是客戶端丟鍵（2026-08-30 以真實 sink 資料修正歸因）**：某真實環境累積 56 筆拒絕紀錄的實測分佈為 `unknown-tool` 21 筆（38%）／`missing-required-args` 25 筆（45%）／`missing-project-root` 10 筆（18%）。前兩類是**本 repo 可處理**的名稱問題：工具名誤用上游官方 memory server 的名稱（`aim_memory_search_nodes` ×9、`aim_memory_open_nodes`、`aim_memory_read`）或掉前綴（`search`、`list_stores`）——本 fork 改名後模型退回訓練先驗；參數名則是單複數／同義詞漂移（`get` 要 `names` 收到 `name` ×10、`entityName` ×3；`replace_fact` 收到 `oldFact/newFact` ×4）。**因此 `unknown-tool` 與 `missing-required-args` 的訊息都帶 did-you-mean 建議**（`suggestToolName` / `suggestKeyFix`，重用 storage 的 `boundedLevenshtein`），unknown-tool 另附完整工具清單——成本不對稱：宿主在工具錯誤時會附整份 tools/list（實測 40KB），訊息裡幾百字元的線索遠比讓呼叫端再錯一輪便宜。**此前 README／AGENTS.md／圖譜三處都把拒絕一律歸因為客戶端丟鍵並建議「重試即可」，那會讓真正該修的（呼叫端規則沒帶 projectRoot、名稱用錯）被當成客戶端 bug**
+- **⚠️ 拒絕的主因是呼叫端用錯名稱，不是客戶端丟鍵（2026-08-30 以真實 sink 資料修正歸因）**：某真實環境累積 56 筆拒絕紀錄的實測分佈為 `unknown-tool` 21 筆（38%）／`missing-required-args` 25 筆（45%）／`missing-project-root` 10 筆（18%）。前兩類是**本 repo 可處理**的名稱問題：工具名誤用上游官方 memory server 的名稱（`aim_memory_search_nodes` ×9、`aim_memory_open_nodes`、`aim_memory_read`）或掉前綴（`search`、`list_stores`）——本 fork 改名後模型退回訓練先驗；參數名則是單複數／同義詞漂移（`get` 要 `names` 收到 `name` ×10、`entityName` ×3；`replace_fact` 收到 `oldFact/newFact` ×4）。**因此 `unknown-tool` 與 `missing-required-args` 的訊息都帶 did-you-mean 建議**（`suggestToolName` / `suggestKeyFix`，重用 search.ts 的 `boundedLevenshtein`），unknown-tool 另附完整工具清單——成本不對稱：宿主在工具錯誤時會附整份 tools/list（實測 40KB），訊息裡幾百字元的線索遠比讓呼叫端再錯一輪便宜。**此前 README／AGENTS.md／圖譜三處都把拒絕一律歸因為客戶端丟鍵並建議「重試即可」，那會讓真正該修的（呼叫端規則沒帶 projectRoot、名稱用錯）被當成客戶端 bug**
 - **客戶端橋接層確實會間歇性丟失參數鍵，但屬較少數**：判準是**其餘鍵俱在、獨缺一鍵**；同一 payload 隔幾分鐘重試即成功、與內容大小／中英文／鍵序無關、持續數小時正常後突然一段窗口連續失敗再自愈。**這一類重試即可**；持續失敗請檢查客戶端 MCP 連線狀態。⚠️ **只送了一個鍵時（如 `received keys: entities`）無法區分丟鍵與呼叫端從未帶**，先查呼叫端規則（重連風暴期間客戶端殺掉並重啟健康的 server 行程，重試時觀察到丟參數——2026-08-11/12 remove_facts/replace_fact「崩潰」即此成因）。判讀方式見上一條的 `received keys`：其餘鍵俱在獨缺一鍵＝客戶端丟鍵；`(none)`＝整包 arguments 丟失；**客戶端報錯但伺服器 stderr 無對應時間戳的紀錄＝請求根本沒到伺服器**（錯誤由客戶端自行合成）
 - **伺服器端已排除嫌疑，勿重複調查**：`test/large-payload.test.ts` 以真實 server 子行程連續 50 輪 `store` + `add_facts`（每條 observation ≥ 8KB 中文、100 個請求一次灌進 stdin）全綠且落盤完整。該測試已通過突變檢查（人為在第 37 次呼叫刪掉 `projectRoot` → 測試變紅），確認它抓得到單次丟鍵，不是永遠綠的裝飾
 - **多個客戶端 = 多個 server 行程共用同一份 JSONL，且跨行程無寫入互斥**：2026-08-23 實測同時有三個行程跑 `dist/index.js --workspace-only`——parent 分別是 Devin 的 `devin acp`、Devin 的 `language_server`、DataGrip 的 Codeium `language_server`。`runExclusive`（`storage.ts` 的 `writeChains`）掛在 manager 實例上，**只能 per-process 互斥**，跨行程的 read-modify-write 存在 lost-update 窗口（風險已識別，尚未觀察到確定的資料遺失）。另一個推論：**重啟一個客戶端不等於舊碼行程消失**——當時 DataGrip 那個行程已從前一天跑到現在，仍在執行改版前的舊碼。改完 `dist` 後若某個客戶端行為與預期不符，先 `ps aux | grep knowledge-graph-mcp` 看有幾個行程、各自何時啟動
