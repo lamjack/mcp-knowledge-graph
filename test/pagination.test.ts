@@ -92,6 +92,15 @@ test('capText: truncates oversized text, stays within the cap, and appends guida
   assert.match(out, /offset\/limit/);
 });
 
+test('capText: 極小上限（notice 放不下）時純硬切，輸出絕不超限', () => {
+  // 硬上限是對客戶端的保證（輸出絕不超過 max）。notice 本身約 180 字元，
+  // max 小於它時「截斷 + 附指引」會讓輸出超出自己的預算——指引放不下的預算裡，
+  // 塞半截 notice 一樣是破損內容，純硬切是唯一不破保證的做法。
+  const s = 'x'.repeat(1000);
+  assert.equal(capText(s, 50).length, 50, 'max 小於 notice 長度時輸出仍不得超過 max');
+  assert.equal(capText(s, 0).length, 0, 'max=0 時輸出為空');
+});
+
 // --- autoPaginateText ------------------------------------------------------
 
 test('autoPaginateText: returns null when not even one entity fits the budget', () => {
@@ -189,7 +198,11 @@ test('read_all over stdio: limit returns only N entities and a [page] header wit
   assert.doesNotMatch(text, /- E2 \(t\)/);
 });
 
-test('read_all over stdio: --max-output-chars truncates oversized output with guidance', async () => {
+test('read_all over stdio: --max-output-chars 連一頁都放不下時走硬切，且輸出絕不超限', async () => {
+  // 測試前提更新（capText 修復後）：max=80 時自動分頁失敗（單頁 ~150 字元），
+  // 而指引 notice 約 180 字元也放不下——capText 退回純硬切。此情境下能斷言的
+  // 是硬上限保證本身：輸出絕不超過 80 字元。（附指引的路徑由 max=200 的
+  // 單元測試覆蓋：「capText: truncates oversized text ... and appends guidance」。）
   const root = tmpRoot();
   await seed(root, 6);
   const out = await driveServer(
@@ -200,7 +213,8 @@ test('read_all over stdio: --max-output-chars truncates oversized output with gu
   const resp = out.find(m => m.id === 3);
   assert.ok(resp?.result, 'expected a read_all result');
   const text: string = resp.result.content[0].text;
-  assert.match(text, /truncated/);
+  assert.ok(text.length <= 80, `hard-capped length ${text.length} must be <= 80`);
+  assert.ok(text.length > 0, '仍回傳前綴內容而非空字串');
 });
 
 test('read_all over stdio: oversized unpaginated output auto-paginates instead of truncating', async () => {

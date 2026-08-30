@@ -62,9 +62,13 @@ export function slotOfDatedKey(keyHead: string): string {
 }
 
 // 三種陳舊/重複偵測（duplicateCandidates / journalEntities / unresolvedMarkers）皆不適用的
-// entityType（正規化比較）。SessionLog 依設計就是帶時序的流水帳且 pending 區塊本來就在列
-// 未決事項，三者對它都是必然命中；必然命中的信號不是信號，只會淹沒真正的問題。
-// 它的體積與收斂由區塊保留上限（與 prune 時的 pending 處理）負責，不由本審計負責。
+// entityType（正規化比較）。
+// ⚠️ 這是對**舊圖譜**的防禦，不是活契約：支配方法學（memory-graph-curation）已於
+// 2026-08-24 廢除 transient SessionLog 層並禁止重建，新的圖譜不該再出現 SessionLog 實體。
+// 保留豁免是為了仍存有 SessionLog 實體的舊圖譜——它依設計是帶時序的流水帳且 pending
+// 區塊本來就在列未決事項，三種偵測對它都是必然命中；必然命中的信號不是信號，
+// 只會淹沒真正的問題。若哪天確認所有 workspace 的圖譜都已無 SessionLog，此豁免可連同
+// 文檔段落一併清除。
 const AUDIT_EXEMPT_TYPES = new Set(['sessionlog']);
 
 // 單一實體內帶日期 key 的數量門檻與佔比門檻，須同時達標。數量濾掉零星標註
@@ -253,8 +257,8 @@ export function auditGraph(graph: KnowledgeGraph, database: string): DoctorRepor
   );
 
   // unresolvedMarkers：仍帶未結案標記的 observation，依 entity 匯總。
-  // SessionLog 同樣豁免：`pending:` 區塊本來就在列未決事項，每個 session 必然命中——
-  // 必然命中的信號不是信號。它的收斂由區塊保留上限與 prune 時的 pending 處理負責。
+  // SessionLog 同樣豁免（舊圖譜防禦，見 AUDIT_EXEMPT_TYPES）：`pending:` 區塊本來就在
+  // 列未決事項，每個 session 必然命中——必然命中的信號不是信號。
   const unresolvedMarkers: DoctorReport['unresolvedMarkers'] = [];
   for (const e of graph.entities) {
     if (AUDIT_EXEMPT_TYPES.has(normalizeTypeKey(e.entityType))) continue;

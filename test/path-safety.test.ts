@@ -14,7 +14,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 
 // 從編譯後的模組匯入。伺服器的 main() 有守衛，
 // 因此在此匯入不會啟動 stdio transport。
-import { assertContextSafe, assertInScope, assertProjectRootSafe, getMemoryFilePath } from '../index.js';
+import { assertContextSafe, assertInScope, assertProjectRootSafe, getMemoryFilePath } from '../storage.js';
 
 test('assertContextSafe accepts ordinary context identifiers', () => {
   for (const ok of ['work', 'personal', 'health', 'project_2024', 'a-b.c', 'A1']) {

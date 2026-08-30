@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { statSync, utimesSync } from 'node:fs';
 
-import { KnowledgeGraphManager, type KnowledgeGraph } from '../storage.js';
+import { KnowledgeGraphManager, observationMatcher, type KnowledgeGraph } from '../storage.js';
 import { filterObservations } from '../server.js';
 import { INIT, INITIALIZED, call, driveServer, tmpRoot as makeTmpRoot } from './helpers.js';
 
@@ -97,6 +97,29 @@ test('deleteObservations exact 模式 0 命中：removed:0、unmatched 全列、
   ]);
   const g = await mgr.readGraph(undefined, undefined, root);
   assert.equal(g.entities.find(e => e.name === 'Log')!.observations.length, 5, '未刪任何條目');
+});
+
+test('observationMatcher：prefix 只命中開頭；恰一語義 fail-closed', () => {
+  // 這個區別曾無人守衛：把 prefix 的 startsWith 突變成 includes 時 209 個測試全綠——
+  // 因為所有前綴測資的命中串都只出現在開頭。語義收斂到 observationMatcher 後，
+  // 這一個突變點會同時影響四條路徑，必須有測試咬住它。
+  const prefix = observationMatcher({ prefix: 'session ' });
+  assert.ok(prefix('session 2026-08-01｜did X'), '開頭命中');
+  assert.ok(!prefix('note: session 只是中段例證'), '中段出現不得命中 prefix（否則 prune 誤刪）');
+  const substring = observationMatcher({ substring: 'session ' });
+  assert.ok(substring('note: session 中段也算'), 'substring 才命中中段');
+  const exact = observationMatcher({ exact: new Set(['a', 'b']) });
+  assert.ok(exact('a') && exact('b') && !exact('a '), 'exact 為逐字集合成員');
+  assert.throws(
+    () => observationMatcher({}),
+    /exactly one/,
+    '全缺不得放行（matches-all 在刪除路徑即全刪）',
+  );
+  assert.throws(
+    () => observationMatcher({ prefix: 'a', substring: 'b' }),
+    /exactly one/,
+    '多於一個也不得放行',
+  );
 });
 
 test('deleteObservations 0 刪除時不寫檔（不觸碰 mtime，比照 replaceFact 紀律）', async () => {

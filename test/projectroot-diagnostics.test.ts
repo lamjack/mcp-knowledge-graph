@@ -15,10 +15,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 
 import { argsDiagnostic, macauIsoTimestamp } from '../server.js';
 import { PROJECT_ROOT_REQUIRED_MESSAGE } from '../storage.js';
+import { DIAGNOSTIC_SINK_MAX_BYTES } from '../diagnostics.js';
 import { INIT, INITIALIZED, call, runServer, tmpRoot as makeTmpRoot } from './helpers.js';
 
 function tmpRoot(): string {
@@ -258,6 +259,28 @@ test('診斷檔案為追寫而非覆寫——連續故障窗口的每一筆都�
   assert.equal(lines.length, 2, '兩次拒絕必須是兩行，後者不得覆蓋前者');
   assert.match(lines[0]!, /reqId=11;/);
   assert.match(lines[1]!, /reqId=12;/);
+});
+
+test('--diagnostic-log 超過大小上限時輪轉為單一 .1 備份（sink 不再無限增長）', async () => {
+  // 追寫無上限曾讓診斷檔只增不減。診斷的價值在「最近那個失敗窗口」，
+  // 舊紀錄邊際價值遞減，故越界時整檔輪轉為 .1（最多再留一代）。
+  // 測法：先把 sink 墊到上限邊緣，一筆拒絕即迫使輪轉在本次寫入時發生。
+  const root = tmpRoot();
+  const logFile = path.join(root, 'diagnostic-rotate.log');
+  writeFileSync(logFile, 'x'.repeat(DIAGNOSTIC_SINK_MAX_BYTES - 10));
+  await runServer(
+    ['--workspace-only', `--diagnostic-log=${logFile}`],
+    [INIT, INITIALIZED, call(8, 'aim_memory_store', { entities: [] })],
+    8,
+  );
+  assert.equal(
+    statSync(`${logFile}.1`).size,
+    DIAGNOSTIC_SINK_MAX_BYTES - 10,
+    '上一代必須完整保留在 .1（rename 是整檔搬移）',
+  );
+  const current = readFileSync(logFile, 'utf-8');
+  assert.match(current, /tool call rejected/, '本次紀錄進入輪轉後的新檔');
+  assert.ok(statSync(logFile).size < 1000, '輪轉後新檔只含本次紀錄');
 });
 
 test('成功路徑不建立診斷檔案——未配置與已配置皆不得產生噪音', async () => {

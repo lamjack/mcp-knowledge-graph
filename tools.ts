@@ -1,7 +1,6 @@
 // MCP 工具 schema 定義。共享屬性片段只宣告一次（DRY），跨工具重複使用。
 
 import type { Tool, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
-import { workspaceOnly } from "./config.js";
 
 // Tool annotations（spec 2025-06-18）：讓客戶端不必解析描述文字就能分辨唯讀與破壞性工具，
 // 並給刪除類操作一個確認 UX 的掛點。四個 hint 全部顯式給出而非依賴預設值（預設
@@ -662,7 +661,7 @@ RETURNS an object with:
 - duplicateCandidates: within one entity, observations sharing a key prefix (possible stale versions), as {entityName, keyPrefix, count, excerpts} - count exact, excerpts sample at most 3 at 120 chars each. ':' and full-width '：' both separate. A legitimately multi-valued key (several "service: ..." lines) looks identical and is reported too, so judge a group before acting; use get({names, observationPrefix}) for full bodies
 - journalEntities: entities drifting from a state store into a work journal, as {entityName, datedKeys, totalObservations, sameSlotGroups:[{slot, count, keyPrefixes}]}. A dated key head is new on every write, so nothing supersedes it and nothing detects the pile-up. Listed on 5+ dated keys, or when two keys collapse to one slot after stripping the date - that pair is a same-fact duplicate duplicateCandidates cannot see, because every key is unique. Fix: keep the current value as one dateless slot via add_facts.upsertKeyed, then prune each superseded keyPrefix via remove_facts.observationPrefix, or move it to the session log if the history matters
 - unresolvedMarkers: observations still carrying TODO / TBD / 待確認 / 待驗證 / 待定 / 待補 / 暫定, as {entityName, count, markers, excerpts} (same sampling). These were recorded while something was undecided, and nobody returns to update them once it is settled. Re-check each: settled -> upsertKeyed the slot; still open -> leave it; obsolete -> remove_facts
-- SessionLog entities are exempt from those three checks: a session log is a journal whose pending blocks are meant to list open items, so all three would fire every time, and a signal that always fires is not a signal. The block-retention cap governs its size instead
+- SessionLog entities are exempt from those three checks (legacy-graph defense): the transient SessionLog tier was abolished by the governing curation methodology on 2026-08-24 and must not be recreated, but graphs written before then may still hold SessionLog entities - a session log is a journal whose pending blocks are meant to list open items, so all three checks would fire every time, and a signal that always fires is not a signal
 - oversizedEntities: entities whose observation count (>=50) or total observation characters (>=10,000) reach curation thresholds, sorted by totalChars descending. Advisory only: such hub entities eat a large share of the output budget whenever search/get matches them - split them into smaller entities or prune stale observations
 - stats: entity/relation/observation counts and per-entityType distribution for the audited database
 
@@ -764,7 +763,7 @@ export const PARAM_ALIASES: Record<string, Record<string, string>> = {
 };
 
 // Workspace-only 嚴格模式：對外公告的 schema 需與執行時的 fail-closed 行為一致，
-// 否則模型會照著描述送出被拒絕的 global 呼叫。因此在此模式下：
+// 否則模型會照著描述送出被拒絕的 global 呼叫。因此該模式的公告版本：
 //   1. 將 projectRoot 標記為每個工具必填（提示層；實際強制在 storage.ts）。
 //   2. 移除 location 屬性 —— global 被停用、project 在有 projectRoot 時多餘。
 //   3. 刪掉描述中所有 global/location 的說明與範例，因為那些功能在此模式下不存在。
@@ -774,27 +773,43 @@ export const PARAM_ALIASES: Record<string, Record<string, string>> = {
 // 15 個工具共用的片段每省 1 字元就省 15 字元。原始版本有約 9,400 字元屬機械性重複
 // （projectRoot 描述 349×15、公告 217×15、以及 6 行已停用功能的範例），
 // 遠大於一個專案記憶本身的召回量，故在此一次性壓縮。行為性指引不在削減範圍。
-if (workspaceOnly) {
-  const note = "[workspace-only mode] Pass projectRoot = the current workspace's absolute root path on every call.\n\n";
-  const conciseProjectRoot = {
-    type: "string",
-    description: "Absolute path to the current workspace root; memory lives in <projectRoot>/.aim/. Required.",
+//
+// 2026-08-30 工廠化：舊實作在 import 時就改寫已匯出的 TOOL_DEFINITIONS（隱式全域可變
+// 狀態——`export const` 的 const 只保護綁定不保護內容），使同一行程永遠無法同時服務
+// 兩種模式、所有 workspace-only 測試被迫 spawn 子行程。現在後處理以副本進行：
+// buildToolDefinitions(true) 回傳新物件陣列，基底定義保持原樣，兩種視圖可同行程共存。
+const WORKSPACE_ONLY_NOTE = "[workspace-only mode] Pass projectRoot = the current workspace's absolute root path on every call.\n\n";
+const CONCISE_PROJECT_ROOT_PROP = {
+  type: "string",
+  description: "Absolute path to the current workspace root; memory lives in <projectRoot>/.aim/. Required.",
+};
+// 已停用功能的殘留文字：location 段落、以及提及 global/project location 的範例行。
+const DEAD_LINE = /^(LOCATION OVERRIDE:|- (?:Master|Work|Personal|Global)[^\n]*\bin (?:global|project) location:)/;
+
+function applyWorkspaceOnly(tool: Tool): Tool {
+  // schema 保持 SDK 的完整型別（含 type: "object"），只把 properties 放寬為可改寫的副本。
+  const schema = tool.inputSchema;
+  const properties: Record<string, object> = { ...schema.properties };
+  delete properties.location;
+  if (properties.projectRoot) properties.projectRoot = CONCISE_PROJECT_ROOT_PROP;
+  const body = (tool.description ?? "")
+    .split("\n")
+    .filter(line => !DEAD_LINE.test(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return {
+    ...tool,
+    description: WORKSPACE_ONLY_NOTE + body,
+    inputSchema: {
+      ...schema,
+      required: Array.from(new Set([...(schema.required ?? []), "projectRoot"])),
+      properties,
+    },
   };
-  // 已停用功能的殘留文字：location 段落、以及提及 global/project location 的範例行。
-  const deadLine = /^(LOCATION OVERRIDE:|- (?:Master|Work|Personal|Global)[^\n]*\bin (?:global|project) location:)/;
-  for (const tool of TOOL_DEFINITIONS) {
-    const schema = tool.inputSchema as { required?: string[]; properties?: Record<string, unknown> };
-    schema.required = Array.from(new Set([...(schema.required ?? []), "projectRoot"]));
-    if (schema.properties) {
-      delete schema.properties.location;
-      if (schema.properties.projectRoot) schema.properties.projectRoot = conciseProjectRoot;
-    }
-    const body = (tool.description ?? "")
-      .split("\n")
-      .filter(line => !deadLine.test(line.trim()))
-      .join("\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-    tool.description = note + body;
-  }
+}
+
+// 對外公告用的工具定義。嚴格模式回傳後處理副本；非嚴格模式原樣回傳基底（零拷貝）。
+export function buildToolDefinitions(workspaceOnlyMode: boolean): Tool[] {
+  return workspaceOnlyMode ? TOOL_DEFINITIONS.map(applyWorkspaceOnly) : TOOL_DEFINITIONS;
 }

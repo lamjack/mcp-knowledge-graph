@@ -306,12 +306,31 @@ export function formatGraphConcise(graph: KnowledgeGraph, context?: string): str
   return lines.join('\n');
 }
 
-// 搜尋選項：limit 限制 seed 命中數量，depth 控制 ego-graph 擴展跳數。
-// 明確允許 undefined，讓呼叫端可直接透傳未提供的工具參數（exactOptionalPropertyTypes）。
 // 關係的唯一鍵：以 NUL 分隔 from/relationType/to，避免值中含分隔字元造成碰撞。
 // 用於以 Set 做 O(1) 的關係去重與刪除，取代嵌套線性掃描。
 function relationKey(r: Relation): string {
   return `${r.from}\u0000${r.relationType}\u0000${r.to}`;
+}
+
+// observation 選取謂詞的單一出口。「命中」有三種語義：exact（逐字等於集合中任一條）／
+// prefix（前綴）／substring（子字串）。此概念曾散在 4 處跨 2 層（server 的 get 過濾、
+// 本檔的 deleteObservations / countObservations / replaceFact），改語義要改 4 處；
+// 收斂後四處共用同一份實作。各呼叫端的「恰擇一且非空」驗證保留在原處——錯誤訊息是
+// 各工具的對外契約；這裡的恰一檢查是最後防線（全缺時若當成 substring:'' 放行會
+// matches-all，在刪除路徑上即全刪，必須 fail-closed）。
+export function observationMatcher(spec: {
+  exact?: ReadonlySet<string> | undefined;
+  prefix?: string | undefined;
+  substring?: string | undefined;
+}): (o: string) => boolean {
+  const { exact, prefix, substring } = spec;
+  const modes = [exact !== undefined, prefix !== undefined, substring !== undefined].filter(Boolean).length;
+  if (modes !== 1) {
+    throw new Error('observationMatcher requires exactly one of exact / prefix / substring');
+  }
+  if (exact !== undefined) return o => exact.has(o);
+  if (prefix !== undefined) return o => o.startsWith(prefix);
+  return o => o.includes(substring!);
 }
 
 // 由「既有型別集合 + 本次新增實體」偵測 entityType 格式碰撞警告：新型別與某既有型別
@@ -675,9 +694,8 @@ export class KnowledgeGraphManager {
           };
         }
         const present = new Set(entity.observations);
-        const kept = spec.kind === 'exact'
-          ? entity.observations.filter(o => !spec.toRemove.has(o))
-          : entity.observations.filter(o => !o.startsWith(spec.prefix));
+        const matches = observationMatcher(spec.kind === 'exact' ? { exact: spec.toRemove } : { prefix: spec.prefix });
+        const kept = entity.observations.filter(o => !matches(o));
         const removed = entity.observations.length - kept.length;
         totalRemoved += removed;
         if (removed > 0) entity.observations = kept;
@@ -715,7 +733,7 @@ export class KnowledgeGraphManager {
           groups: delimiter !== undefined ? [] : undefined,
         };
       }
-      const hits = entity.observations.filter(o => o.startsWith(observationPrefix));
+      const hits = entity.observations.filter(observationMatcher({ prefix: observationPrefix }));
       let groups: { key: string; count: number }[] | undefined;
       if (delimiter !== undefined) {
         const counts = new Map<string, number>();
@@ -832,11 +850,9 @@ export class KnowledgeGraphManager {
     if (modes !== 1) {
       throw new Error('replaceFact requires exactly one of matchPrefix, matchSubstring or matchExact');
     }
-    const predicate = hasExact
-      ? (o: string) => o === match.exact!
-      : hasPrefix
-        ? (o: string) => o.startsWith(match.prefix!)
-        : (o: string) => o.includes(match.substring!);
+    const predicate = observationMatcher(
+      hasExact ? { exact: new Set([match.exact!]) } : hasPrefix ? { prefix: match.prefix! } : { substring: match.substring! },
+    );
 
     const filePath = this.resolvePath(context, location, projectRoot);
     return this.runExclusive(filePath, async () => {

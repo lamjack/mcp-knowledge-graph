@@ -5,7 +5,7 @@
 // 兩層各寫一份 IO 會讓格式與 sink 目標漂移，而事後對拍靠的正是格式一致。
 // 本模組只依賴 config（葉節點），故 storage 與 server 都能匯入而不成環。
 
-import { appendFileSync } from 'fs';
+import { appendFileSync, renameSync, statSync } from 'fs';
 
 import { diagnosticLogPath } from './config.js';
 
@@ -37,10 +37,35 @@ export function recordDiagnostic(event: string, detail: string): void {
 // 同步寫入是刻意的——這條路徑罕見，換取紀錄不會因行程結束而遺失。
 // 寫檔失敗只降級為 stderr 警告，絕不讓診斷輔助本身弄壞正常回應；若該客戶端連 stderr
 // 都丟棄，這則警告也會消失，這是 sink 不可用時能做到的極限。
+//
+// 大小上限與輪轉：無上限的追寫曾讓 sink 只增不減（實測 10.5KB 且永不收斂）。
+// 診斷的價值在「最近那個失敗窗口」，舊紀錄邊際價值遞減，故越界時把現檔 rename 為
+// 單一 `.1` 備份（最多再留一代），磁碟佔用封頂在約 2 倍上限。1MB 對每行約兩百字元的
+// 拒絕紀錄約可裝數千筆，遠超任何故障窗口的長度。匯出常量是為了讓測試能把 sink
+// 墊到上限邊緣、以單筆寫入觸發輪轉，而不必真的灌 1MB。
+export const DIAGNOSTIC_SINK_MAX_BYTES = 1_048_576;
+
 function appendToSink(record: string): void {
   if (diagnosticLogPath === undefined) return;
   try {
-    appendFileSync(diagnosticLogPath, `${record}\n`, 'utf-8');
+    const line = `${record}\n`;
+    let size = 0;
+    try {
+      size = statSync(diagnosticLogPath).size;
+    } catch {
+      // 檔案尚不存在（或不可讀）→ 視為 0，下面的 append 會建立它。
+    }
+    if (size > 0 && size + Buffer.byteLength(line, 'utf-8') > DIAGNOSTIC_SINK_MAX_BYTES) {
+      // 輪轉失敗（權限等）不阻斷紀錄本身：降級為警告後照常追寫——sink 的存在目的
+      // 就是捕捉故障窗口，輪轉失敗不能反過來丟掉證據。
+      try {
+        renameSync(diagnosticLogPath, `${diagnosticLogPath}.1`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        console.error(`${macauIsoTimestamp()} ${PREFIX} diagnostic log rotation failed: ${reason}`);
+      }
+    }
+    appendFileSync(diagnosticLogPath, line, 'utf-8');
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.error(`${macauIsoTimestamp()} ${PREFIX} diagnostic log write failed: ${reason}`);

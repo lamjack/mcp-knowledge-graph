@@ -7,6 +7,8 @@
 
 import type { Entity, KnowledgeGraph } from './storage.js';
 
+// 搜尋選項：limit 限制 seed 命中數量，depth 控制 ego-graph 擴展跳數。
+// 明確允許 undefined，讓呼叫端可直接透傳未提供的工具參數（exactOptionalPropertyTypes）。
 export interface SearchOptions {
   limit?: number | undefined;
   depth?: number | undefined;

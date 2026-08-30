@@ -15,8 +15,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TOOL_DEFINITIONS } from '../tools.js';
-import { TOOL_HANDLERS, suggestToolName, suggestKeyFix } from '../server.js';
+import { TOOL_DEFINITIONS, buildToolDefinitions } from '../tools.js';
+import { TOOL_HANDLERS, suggestToolName, suggestKeyFix, dispatchTool } from '../server.js';
 import { INIT, INITIALIZED, call, driveServer, tmpRoot as makeTmpRoot } from './helpers.js';
 
 function tmpRoot(): string {
@@ -115,6 +115,54 @@ test('formatProp 宣告的格式必須全部出現在工具描述中（模型只
       );
     }
   }
+});
+
+test('buildToolDefinitions：workspace-only 後處理以副本進行，基底定義永不被改寫', () => {
+  // 舊實作在 import 時就改寫已匯出的 TOOL_DEFINITIONS（隱式全域可變狀態——
+  // export const 的 const 只保護綁定不保護內容），使同一行程無法同時服務兩種模式，
+  // 所有 workspace-only 測試被迫 spawn 子行程。工廠化後後處理產生新物件，
+  // 基底陣列保持非嚴格模式的樣子，兩種視圖可在同一行程共存。
+  const processed = buildToolDefinitions(true);
+  const base = TOOL_DEFINITIONS.find(t => t.name === 'aim_memory_store')!;
+  const strict = processed.find(t => t.name === 'aim_memory_store')!;
+  // 嚴格副本：projectRoot 必填、location 移除、描述帶公告、annotations 保留。
+  assert.ok((strict.inputSchema as any).required.includes('projectRoot'));
+  assert.equal((strict.inputSchema as any).properties.location, undefined);
+  assert.match(strict.description!, /^\[workspace-only mode\]/);
+  assert.equal(strict.annotations?.readOnlyHint, false, '後處理不得剝除 annotations');
+  // 基底原樣：required 無 projectRoot、location 仍在、描述無公告。
+  const baseRequired = (base.inputSchema as any).required as string[] | undefined;
+  assert.ok(
+    baseRequired === undefined || !baseRequired.includes('projectRoot'),
+    '基底的 required 不得被寫入 projectRoot',
+  );
+  assert.ok((base.inputSchema as any).properties.location, '基底定義的 location 不得被剝除');
+  assert.doesNotMatch(base.description!, /^\[workspace-only mode\]/);
+  // 非嚴格模式回傳基底本身（零拷貝、零改寫）。
+  assert.equal(buildToolDefinitions(false), TOOL_DEFINITIONS);
+});
+
+test('dispatchTool 可注入處理器表（DIP）：假存儲直通，不再硬綁 knowledgeGraphManager 單例', async () => {
+  // 類別早就有 workspaceOnly 建構子 seam，缺的是模組邊界這層：派發表曾直接
+  // close over 單例，dispatchTool 無法對假存儲做單元測試，五個測試檔被迫全走
+  // spawn 子行程。注入第三參數後，派發接線（名稱解析 → 驗證 → 處理器）可在
+  // 行程內對假表驗證；預設值保留正式路徑的單例行為（呼叫端零改動）。
+  const marker = 'fake-store-answer';
+  const fake = Object.fromEntries(
+    Object.keys(TOOL_HANDLERS).map(name => [
+      name,
+      async () => ({ content: [{ type: 'text', text: marker }] }),
+    ]),
+  );
+  const result = await dispatchTool(
+    { method: 'tools/call', params: { name: 'aim_memory_read_all', arguments: {} } } as any,
+    1,
+    fake,
+  );
+  assert.ok(
+    JSON.stringify(result).includes(marker),
+    '注入的假處理器必須被呼叫，而非單例的真實存儲',
+  );
 });
 
 test('派發表與工具定義完全對應：宣告了就一定能執行，能執行的一定有宣告', () => {

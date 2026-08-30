@@ -20,13 +20,15 @@ import {
   formatGraphConcise,
   findProjectRoot,
   PROJECT_ROOT_REQUIRED_MESSAGE,
+  observationMatcher,
+  type KnowledgeGraphManager,
   type KnowledgeGraph,
   type Entity,
   type Relation,
   type DeleteObservationsEntry,
 } from './storage.js';
 import { boundedLevenshtein, normalizeNonNegInt } from './search.js';
-import { TOOL_DEFINITIONS, TOOL_NAME_ALIASES, PARAM_ALIASES } from './tools.js';
+import { TOOL_DEFINITIONS, TOOL_NAME_ALIASES, PARAM_ALIASES, buildToolDefinitions } from './tools.js';
 
 // 依 format 參數序列化圖譜。'concise' 為 token 精簡格式，'pretty' 為人類可讀，
 // 其餘（含未指定）一律回退到結構化 JSON，維持既有預設行為。
@@ -62,9 +64,7 @@ export function filterObservations(graph: KnowledgeGraph, rawPrefix: unknown, ra
   }
   if (prefix === undefined && substring === undefined) return { graph, header: null };
 
-  const predicate = prefix !== undefined
-    ? (o: string) => o.startsWith(prefix)
-    : (o: string) => o.includes(substring!);
+  const predicate = observationMatcher(prefix !== undefined ? { prefix } : { substring: substring! });
   let total = 0;
   let matched = 0;
   let entitiesMatched = 0;
@@ -142,7 +142,10 @@ export function autoPaginateText(graph: KnowledgeGraph, format: unknown, context
 export function capText(text: string, max: number): string {
   if (text.length <= max) return text;
   const notice = `\n\n[truncated: output exceeded ${max} chars (was ${text.length}). Narrow the result: use includeObservations:false, aim_memory_search, or read_all with offset/limit.]`;
-  const budget = Math.max(0, max - notice.length);
+  // notice 比 max 還長時（病態小上限），指引本身放不下——塞它進去反而超出自己的預算。
+  // 硬上限是對客戶端的保證，此時退回純硬切（連 notice 都不附）。
+  if (notice.length >= max) return text.slice(0, Math.max(0, max));
+  const budget = max - notice.length;
   return text.slice(0, budget) + notice;
 }
 
@@ -165,12 +168,85 @@ export function argsDiagnostic(toolName: string, args: Record<string, unknown> |
   return `[diagnostic] tool=${toolName}; received keys: ${received}; arguments bytes=${bytes}`;
 }
 
-// 工具呼叫的拒絕原因。分四類而非一句「缺參數」，是因為它們對應**不同的客戶端故障形態**，
-// 需要能分別 grep：整包 arguments 沒送、工具名被損壞、缺資料參數、缺 projectRoot。
+// arguments 的執行期型別驗證。低階 Server API 不依 inputSchema 自動驗證 arguments：
+// 過去 assertToolCallArgs 只查 required 鍵存在性，15 個 handler 隨後直接 as cast——
+// 畸形 payload（entities 給字串）以裸 TypeError 落入 isError 通道。此驗證讓對外公告的
+// schema 成為執行期真正強制的契約：它通過後，handler 裡的 as cast 才保證成立。
+//
+// 刻意只走 schema 子集（type / required / properties / items / enum(string) / minimum）：
+// oneOf / not 不走——那兩個 XOR 約束由儲存層各自的工具專屬訊息覆蓋，重複驗證會讓
+// 訊息漂移。未宣告於 properties 的鍵一律放行（additionalProperties 預設允許；
+// 它們另有「未預期鍵」的 did-you-mean 診斷，不屬於型別錯誤）。
+function describeValue(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}
+
+function validateValue(spec: any, value: unknown, path: string): string | null {
+  if (typeof spec !== 'object' || spec === null) return null;
+  switch (spec.type) {
+    case 'string':
+      if (typeof value !== 'string') return `${path} must be a string (received ${describeValue(value)})`;
+      // 本 repo 的 enum 全為 string 型別（format / location），故只在 string 分支檢查。
+      if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
+        return `${path} must be one of [${spec.enum.join(', ')}] (received ${JSON.stringify(value)})`;
+      }
+      return null;
+    case 'boolean':
+      return typeof value === 'boolean' ? null : `${path} must be a boolean (received ${describeValue(value)})`;
+    case 'number': {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return `${path} must be a number (received ${describeValue(value)})`;
+      }
+      if (typeof spec.minimum === 'number' && value < spec.minimum) {
+        return `${path} must be >= ${spec.minimum} (received ${value})`;
+      }
+      return null;
+    }
+    case 'array': {
+      if (!Array.isArray(value)) return `${path} must be an array (received ${describeValue(value)})`;
+      if (spec.items !== undefined) {
+        for (let i = 0; i < value.length; i++) {
+          const err = validateValue(spec.items, value[i], `${path}[${i}]`);
+          if (err !== null) return err;
+        }
+      }
+      return null;
+    }
+    case 'object': {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        return `${path} must be an object (received ${describeValue(value)})`;
+      }
+      const rec = value as Record<string, unknown>;
+      for (const key of (spec.required as string[] | undefined) ?? []) {
+        if (rec[key] === undefined) return `${path}.${key} is required`;
+      }
+      for (const [key, propSpec] of Object.entries((spec.properties as Record<string, unknown> | undefined) ?? {})) {
+        if (rec[key] === undefined) continue;
+        const err = validateValue(propSpec, rec[key], `${path}.${key}`);
+        if (err !== null) return err;
+      }
+      return null;
+    }
+    default:
+      return null; // 未識別的 type 不阻斷（向後相容）。
+  }
+}
+
+// 對整包 arguments 驗證某工具的 inputSchema；回傳第一個錯誤的描述，合法回 null。
+export function validateArgsAgainstSchema(schema: unknown, args: Record<string, unknown>): string | null {
+  return validateValue(schema, args, 'arguments');
+}
+
+// 工具呼叫的拒絕原因。分類而非一句「缺參數」，是因為它們對應**不同的客戶端故障形態**，
+// 需要能分別 grep：整包 arguments 沒送、工具名被損壞、缺資料參數、型別不符、
+// 缺 projectRoot、已宣告但未接線。
 type RejectReason =
   | 'unknown-tool'
   | 'arguments-key-absent'
   | 'missing-required-args'
+  | 'invalid-arguments'
   | 'missing-project-root'
   | 'tool-not-dispatchable';
 
@@ -374,13 +450,20 @@ export const server = new Server({
   },
 });
 
+// 對外公告的工具清單：workspace-only 模式為後處理副本（projectRoot 必填、location 移除、
+// 描述精簡），非嚴格模式為基底定義本身。工廠以副本工作，基底 TOOL_DEFINITIONS 不被改寫——
+// 內部邏輯（名稱解析、必填檢查、alias）一律讀基底，公告視圖只用於 tools/list。
+const advertisedTools = buildToolDefinitions(workspaceOnly);
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOL_DEFINITIONS };
+  return { tools: advertisedTools };
 });
 
-// 工具呼叫的單一驗證入口，依序檢查四件事並一律走 rejectToolCall（診斷 + stderr）：
-// 工具名是否存在、arguments 鍵是否存在、schema 的必填資料參數、workspace-only 的 projectRoot。
-// 順序有意義：工具名未知時無從得知它的 required 清單，故必須最先判。
+// 工具呼叫的單一驗證入口，依序檢查五件事並一律走 rejectToolCall（診斷 + stderr）：
+// 工具名是否存在、arguments 鍵是否存在、schema 的必填資料參數、arguments 的型別、
+// workspace-only 的 projectRoot。
+// 順序有意義：工具名未知時無從得知它的 required 清單，故必須最先判；鍵都不少才輪到
+// 型別（否則型別錯誤會蓋掉「缺鍵」這個更基本的資訊）。
 // projectRoot 的訊息主文沿用 storage 的單一真相常量（指引性更強），但診斷抬頭只能在此
 // 產生——storage 的 getMemoryFilePath 只收到解析後的 projectRoot，結構上看不到呼叫端
 // 實際送來哪些鍵。storage 的同一道檢查保留為最後防線（程式化消費者可繞過 server 層）。
@@ -440,6 +523,18 @@ function assertToolCallArgs(
       `Missing required argument(s) for ${toolName}: ${detail}`,
     );
   }
+  // 型別驗證：必填齊了才驗型別。此檢查讓 inputSchema 從「只公告」變成「執行期強制」，
+  // handler 裡的 as cast 由它擔保——畸形 payload 不再以裸 TypeError 落入 isError。
+  const typeError = validateArgsAgainstSchema(tool.inputSchema, args);
+  if (typeError !== null) {
+    rejectToolCall(
+      'invalid-arguments',
+      toolName,
+      args,
+      requestId,
+      `Invalid argument(s) for ${toolName}: ${typeError}`,
+    );
+  }
   if (workspaceOnly && args.projectRoot === undefined) {
     // 候選路徑接進訊息：實測 10 筆缺 projectRoot 中有 6 筆是 `store | entities`——
     // 呼叫端知道要寫什麼、只是不知道路徑。給它路徑就能一輪改對，而給的同時明說
@@ -482,44 +577,49 @@ interface ToolContext {
 type ToolResult = { content: { type: string; text: string }[] };
 type ToolHandler = (ctx: ToolContext) => Promise<ToolResult>;
 
-// 工具名 → 處理器的派發表，取代原本 15 個 case 的 switch。
+// 工具名 → 處理器的派發表（工廠形式），取代原本 15 個 case 的 switch。
 // 為何改成表：新增工具原本要同時改 tools.ts（schema）與這裡（case），兩者沒有任何
 // 編譯期關聯——漏了後者，請求會落到 switch 的 default 丟出「Unknown tool」，
 // 而它是**已宣告**的工具，訊息語義錯誤，且該路徑繞過 rejectToolCall 因此不留任何
 // 診斷紀錄，違反「每一條拒絕路徑都留紀錄」的契約。表結構讓
 // test/tool-contract.test.ts 能以「鍵集合 ≡ TOOL_DEFINITIONS 名稱集合」把漂移釘死。
-export const TOOL_HANDLERS: Record<string, ToolHandler> = {
+//
+// 2026-08-30 DIP 化：處理器不再 close over knowledgeGraphManager 單例，改由工廠注入。
+// 此前 dispatchTool 無法對假存儲做單元測試，五個測試檔被迫全部 spawn 真子行程；
+// 類別早就有 workspaceOnly 建構子 seam，缺的只是這層模組邊界。
+export function buildToolHandlers(manager: KnowledgeGraphManager): Record<string, ToolHandler> {
+  return {
   aim_memory_store: async ({ args, context, location, projectRoot }) => {
-    const result = await knowledgeGraphManager.createEntities(args.entities as Entity[], context, location, projectRoot);
+    const result = await manager.createEntities(args.entities as Entity[], context, location, projectRoot);
     // 向後相容：無 warning 時維持純陣列輸出；有 warning 時才包成 {entities, warnings} 物件。
     const payload = result.warnings.length > 0 ? { entities: result.entities, warnings: result.warnings } : result.entities;
     return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
   },
 
   aim_memory_link: async ({ args, context, location, projectRoot }) => ({
-    content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createRelations(args.relations as Relation[], context, location, projectRoot, args.allowDangling as boolean | undefined), null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(await manager.createRelations(args.relations as Relation[], context, location, projectRoot, args.allowDangling as boolean | undefined), null, 2) }],
   }),
 
   aim_memory_add_facts: async ({ args, context, location, projectRoot }) => ({
-    content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[]; upsertKeyed?: boolean }[], context, location, projectRoot), null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(await manager.addObservations(args.observations as { entityName: string; contents: string[]; upsertKeyed?: boolean }[], context, location, projectRoot), null, 2) }],
   }),
 
   aim_memory_forget: async ({ args, context, location, projectRoot }) => {
-    await knowledgeGraphManager.deleteEntities(args.entityNames as string[], context, location, projectRoot);
+    await manager.deleteEntities(args.entityNames as string[], context, location, projectRoot);
     return { content: [{ type: "text", text: "Entities deleted successfully" }] };
   },
 
   aim_memory_remove_facts: async ({ args, context, location, projectRoot }) => ({
-    content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.deleteObservations(args.deletions as DeleteObservationsEntry[], context, location, projectRoot), null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(await manager.deleteObservations(args.deletions as DeleteObservationsEntry[], context, location, projectRoot), null, 2) }],
   }),
 
   aim_memory_unlink: async ({ args, context, location, projectRoot }) => {
-    await knowledgeGraphManager.deleteRelations(args.relations as Relation[], context, location, projectRoot);
+    await manager.deleteRelations(args.relations as Relation[], context, location, projectRoot);
     return { content: [{ type: "text", text: "Relations deleted successfully" }] };
   },
 
   aim_memory_read_all: async ({ args, context, location, projectRoot }) => {
-      const graph = await knowledgeGraphManager.readGraph(context, location, projectRoot);
+      const graph = await manager.readGraph(context, location, projectRoot);
       const projected = projectObservations(graph, args.includeObservations);
       // entity 分頁：切片後才格式化，讓大圖可分批讀取；有分頁時前置抬頭告知進度與下一頁 offset。
       const { graph: paged, pageInfo } = paginateGraph(projected, args.offset, args.limit);
@@ -537,7 +637,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_search: async ({ args, context, location, projectRoot }) => {
-    const graph = await knowledgeGraphManager.searchNodes(
+    const graph = await manager.searchNodes(
       args.query as string,
       context, location, projectRoot,
       { limit: args.limit as number | undefined, depth: args.depth as number | undefined },
@@ -546,7 +646,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_get: async ({ args, context, location, projectRoot }) => {
-    const graph = await knowledgeGraphManager.openNodes(args.names as string[], context, location, projectRoot);
+    const graph = await manager.openNodes(args.names as string[], context, location, projectRoot);
     // observation 級過濾（可選）：只留命中條目並附 [obs-filter] 抬頭；未啟動時原樣。
     const { graph: filtered, header } = filterObservations(graph, args.observationPrefix, args.observationSubstring);
     const projected = projectObservations(filtered, args.includeObservations);
@@ -555,7 +655,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_count_observations: async ({ args, context, location, projectRoot }) => {
-    const report = await knowledgeGraphManager.countObservations(
+    const report = await manager.countObservations(
       args.names as string[],
       args.observationPrefix as string,
       args.groupByDelimiter as string | undefined,
@@ -565,11 +665,11 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_list_stores: async ({ projectRoot }) => ({
-    content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.listDatabases(projectRoot), null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(await manager.listDatabases(projectRoot), null, 2) }],
   }),
 
   aim_memory_update_entity: async ({ args, context, location, projectRoot }) => {
-    const updated = await knowledgeGraphManager.updateEntity(
+    const updated = await manager.updateEntity(
       args.name as string,
       { newName: args.newName as string | undefined, entityType: args.entityType as string | undefined },
       context, location, projectRoot,
@@ -578,7 +678,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_replace_fact: async ({ args, context, location, projectRoot }) => {
-    const result = await knowledgeGraphManager.replaceFact(
+    const result = await manager.replaceFact(
       args.entityName as string,
       {
         prefix: args.matchPrefix as string | undefined,
@@ -592,15 +692,20 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   aim_memory_doctor: async ({ context, location, projectRoot }) => {
-    const report = await knowledgeGraphManager.doctor(context, location, projectRoot);
+    const report = await manager.doctor(context, location, projectRoot);
     return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
   },
 
   aim_memory_list_entity_types: async ({ context, location, projectRoot }) => {
-    const types = await knowledgeGraphManager.listEntityTypes(context, location, projectRoot);
+    const types = await manager.listEntityTypes(context, location, projectRoot);
     return { content: [{ type: "text", text: JSON.stringify(types, null, 2) }] };
   },
-};
+  };
+}
+
+// 正式路徑的預設派發表：以單例建構（維持既有行為）；測試以 buildToolHandlers(假存儲)
+// 或 dispatchTool 的第三參數注入取代。
+export const TOOL_HANDLERS = buildToolHandlers(knowledgeGraphManager);
 
 // alias 命中時前置的抬頭。存在的理由：alias 讓呼叫成功，但若什麼都不說，呼叫端就永遠
 // 學不到正名，於是每個 session 都靠 alias 撐著（而 alias 是善意的相容層，不是契約）。
@@ -622,7 +727,7 @@ function adoptedRootNotice(adopted: string | undefined): string | null {
     : `[projectRoot] not provided; adopted the single workspace root reported by the client: "${adopted}". Pass projectRoot explicitly to avoid this notice.`;
 }
 
-async function dispatchTool(request: CallToolRequest, requestId?: RequestId) {
+export async function dispatchTool(request: CallToolRequest, requestId?: RequestId, handlers: Record<string, ToolHandler> = TOOL_HANDLERS) {
   const { name: rawName, arguments: rawArgs } = request.params;
 
   // 名稱正規化先於驗證：上游生態名、掉前綴、單複數與同義詞在此對回 canonical，
@@ -657,7 +762,7 @@ async function dispatchTool(request: CallToolRequest, requestId?: RequestId) {
 
   assertToolCallArgs(name, args, requestId, rootCandidates, rootsState);
 
-  const handler = TOOL_HANDLERS[name];
+  const handler = handlers[name];
   if (!handler) {
     // 結構上不該發生：assertToolCallArgs 已保證 name ∈ TOOL_DEFINITIONS，且
     // test/tool-contract.test.ts 守衛「派發表 ≡ 工具定義」。但仍走 rejectToolCall
